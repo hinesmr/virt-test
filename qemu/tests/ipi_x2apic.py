@@ -1,14 +1,16 @@
-import logging, os, re
+import logging
+import os
+import re
 from autotest.client.shared import error
 from virttest import env_process, aexpect
 
 
-def get_re_average(opt,re_str):
+def get_re_average(opt, re_str):
     """
     Get the average value which match re string.
 
-    @param opt: string that contains all the information.
-    @param re_str: re string used to filter the result.
+    :param opt: string that contains all the information.
+    :param re_str: re string used to filter the result.
     """
 
     values = re.findall(re_str, str(opt))
@@ -16,7 +18,7 @@ def get_re_average(opt,re_str):
     for val in values:
         val = float(val)
         vals += val
-    return vals/len(values)
+    return vals / len(values)
 
 
 @error.context_aware
@@ -31,9 +33,9 @@ def run_ipi_x2apic(test, params, env):
     6) Run pipetest script in guest.
     7) Compare the result of step4 and step6.
 
-    @param test: QEMU test object
-    @param params: Dictionary with the test parameters
-    @param env: Dictionary with test environment.
+    :param test: QEMU test object
+    :param params: Dictionary with the test parameters
+    :param env: Dictionary with test environment.
     """
 
     smp = params.get("smp")
@@ -56,7 +58,8 @@ def run_ipi_x2apic(test, params, env):
         x2apic_check_string = params.get("x2apic_check_string").split(",")
         for check_string in x2apic_check_string:
             if check_string.strip() not in x2apic_output:
-                raise error.TestFail("%s is not displayed in output" % str)
+                msg = "%s is not displayed in output" % check_string
+                raise error.TestFail(msg)
 
     file_link = os.path.join(test.virtdir, "scripts/pipetest.c")
     vm.copy_files_to(file_link, "/tmp/pipetest.c")

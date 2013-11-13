@@ -10,18 +10,18 @@ def run_virsh_cpu_compare(test, params, env):
 
     Compare host CPU with a CPU described by an XML file.
     1.Get all parameters from configuration.
-    2.Prepare temp file saves of CPU infomation.
+    2.Prepare temp file saves of CPU information.
     3.Perform virsh cpu-compare operation.
     4.Confirm the result.
     """
 
     def get_cpu_xml(target, mode, tmp_file, cpu_mode=""):
         """
-        Get CPU infomation and put it into a file.
+        Get CPU information and put it into a file.
 
-        @param: target: Test target, host or guest's cpu description.
-        @param: mode: Test mode, decides file's detail.
-        @param: tmp_file: File saves CPU infomation.
+        :param target: Test target, host or guest's cpu description.
+        :param mode: Test mode, decides file's detail.
+        :param tmp_file: File saves CPU information.
         """
         try:
             cpu_xml_file = open(tmp_file, 'wb')
@@ -41,18 +41,18 @@ def run_virsh_cpu_compare(test, params, env):
                         libvirtxml.add_feature(name)
                     else:
                         libvirtxml.set_feature(feature_num, feature_name)
-                libvirtxml.dict_get('xml').write(cpu_xml_file)
+                libvirtxml.xmltreefile.write(cpu_xml_file)
             elif mode == "clear":
                 # Clear up file detail
                 cpu_xml_file.truncate(0)
             else:
-                libvirtxml.dict_get('xml').write(cpu_xml_file)
+                libvirtxml.xmltreefile.write(cpu_xml_file)
             cpu_xml_file.close()
         except (IndexError, AttributeError):
             if target == "guest":
                 vmxml.undefine()
                 vmxml.define()
-            raise error.TestError("Get CPU infomation failed!")
+            raise error.TestError("Get CPU information failed!")
 
     # Get all parameters.
     ref = params.get("cpu_compare_ref")
