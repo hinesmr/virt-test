@@ -4,8 +4,10 @@ import unittest
 import os
 import shutil
 import logging
+
 import common
-from virttest import xml_utils, virsh, utils_misc, data_dir
+from virttest import xml_utils, utils_misc, data_dir
+from virttest.virsh_unittest import FakeVirshFactory
 from autotest.client import utils
 from autotest.client.shared import error
 from virttest.libvirt_xml import accessors, vm_xml, xcepts, network_xml, base
@@ -176,15 +178,7 @@ class LibvirtXMLTestBase(unittest.TestCase):
                                xml, '', 0)
 
     def setUp(self):
-        # cause any called virsh commands to fail testing unless a mock declared
-        # necessary so virsh module doesn't complain about missing virsh command
-        # and to catch any libvirt_xml interface which calls virsh functions
-        # unexpectidly.
-        self.dummy_virsh = virsh.Virsh(virsh_exec='/bin/false',
-                                       uri='qemu:///system',
-                                       debug=True,
-                                       ignore_status=True)
-
+        self.dummy_virsh = FakeVirshFactory()
         # make a tmp_dir to store informations.
         LibvirtXMLTestBase.__doms_dir__ = os.path.join(data_dir.get_tmp_dir(),
                                                        'domains')
@@ -196,6 +190,7 @@ class LibvirtXMLTestBase(unittest.TestCase):
         self.dummy_virsh.__super_set__('dumpxml', self._dumpxml)
         self.dummy_virsh.__super_set__('domuuid', self._domuuid)
         self.dummy_virsh.__super_set__('define', self._define)
+        self.dummy_virsh.__super_set__('nodedev_dumpxml', self._nodedev_dumpxml)
 
     def tearDown(self):
         librarian.DEVICE_TYPES = list(ORIGINAL_DEVICE_TYPES)
@@ -499,7 +494,7 @@ class AccessorsTest(LibvirtXMLTestBase):
                                   <whatchamacallit secret_sauce='foobar'/>
                                   <whatchamacallit secret_sauce='5'/>
                               </bar></foo>"""
-        foo = Foo(self.dummy_virsh)
+        foo = Foo(virsh_instance=self.dummy_virsh)
         existing = foo.bar
         self.assertEqual(len(existing), 2)
         self.assertEqual(existing[0].secret_sauce, 'foobar')
@@ -520,7 +515,7 @@ class AccessorsTest(LibvirtXMLTestBase):
 class TestLibvirtXML(LibvirtXMLTestBase):
 
     def _from_scratch(self):
-        return capability_xml.CapabilityXML(self.dummy_virsh)
+        return capability_xml.CapabilityXML(virsh_instance=self.dummy_virsh)
 
     def test_uuid(self):
         lvxml = self._from_scratch()
@@ -553,7 +548,7 @@ class TestLibvirtXML(LibvirtXMLTestBase):
 class TestVMXML(LibvirtXMLTestBase):
 
     def _from_scratch(self):
-        vmxml = vm_xml.VMXML('test1', self.dummy_virsh)
+        vmxml = vm_xml.VMXML('test1', virsh_instance=self.dummy_virsh)
         vmxml.vm_name = 'test2'
         vmxml.uuid = 'test3'
         vmxml.vcpu = 4
@@ -915,7 +910,7 @@ class testCAPXML(LibvirtXMLTestBase):
 class testNodedevXMLBase(LibvirtXMLTestBase):
 
     def _from_scratch(self):
-        nodedevxml = nodedev_xml.NodedevXMLBase()
+        nodedevxml = nodedev_xml.NodedevXMLBase(virsh_instance=self.dummy_virsh)
         nodedevxml.name = 'name_test'
         nodedevxml.parent = 'parent_test'
 
@@ -938,19 +933,22 @@ class testNodedevXML(LibvirtXMLTestBase):
 
     def test_new_from_dumpxml(self):
         NodedevXML = nodedev_xml.NodedevXML
-        nodedevxml = NodedevXML.new_from_dumpxml('pci_0000_00_00_0')
+        nodedevxml = NodedevXML.new_from_dumpxml('pci_0000_00_00_0',
+                                                 virsh_instance=self.dummy_virsh)
         self.assertTrue(isinstance(nodedevxml, NodedevXML))
 
     def test_get_key2value_dict(self):
         NodedevXML = nodedev_xml.NodedevXML
-        xml = NodedevXML.new_from_dumpxml('pci_0000_00_00_0')
+        xml = NodedevXML.new_from_dumpxml('pci_0000_00_00_0',
+                                          virsh_instance=self.dummy_virsh)
         result = xml.get_key2value_dict()
 
         self.assertTrue(isinstance(result, dict))
 
     def test_get_key2syspath_dict(self):
         NodedevXML = nodedev_xml.NodedevXML
-        xml = NodedevXML.new_from_dumpxml('pci_0000_00_00_0')
+        xml = NodedevXML.new_from_dumpxml('pci_0000_00_00_0',
+                                          virsh_instance=self.dummy_virsh)
         result = xml.get_key2syspath_dict()
         self.assertTrue(isinstance(result, dict))
 

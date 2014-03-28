@@ -7,6 +7,7 @@ This exports:
 """
 import logging
 import os
+import re
 from autotest.client.shared import error
 from autotest.client import utils
 import utils_misc
@@ -84,6 +85,7 @@ class QemuImg(storage.QemuImg):
             preallocated = params.get("preallocated", "off")
             encrypted = params.get("encrypted", "off")
             image_extra_params = params.get("image_extra_params", "")
+            has_backing_file = params.get('has_backing_file')
 
             qemu_img_cmd += " -o "
             if preallocated != "off":
@@ -94,6 +96,15 @@ class QemuImg(storage.QemuImg):
 
             if image_cluster_size is not None:
                 qemu_img_cmd += "cluster_size=%s," % image_cluster_size
+
+            if has_backing_file == "yes":
+                backing_param = params.object_params("backing_file")
+                backing_file = storage.get_image_filename(backing_param,
+                                                          self.root_dir)
+                backing_fmt = backing_param.get("image_format")
+                qemu_img_cmd += "backing_file=%s," % backing_file
+
+                qemu_img_cmd += "backing_fmt=%s," % backing_fmt
 
             if image_extra_params:
                 qemu_img_cmd += "%s," % image_extra_params
@@ -109,23 +120,24 @@ class QemuImg(storage.QemuImg):
 
             qemu_img_cmd += " %s" % self.size
 
-        image_dirname = os.path.dirname(self.image_filename)
-        if image_dirname and not os.path.isdir(image_dirname):
-            e_msg = ("Parent directory of the image file %s does "
-                     "not exist" % self.image_filename)
-            logging.error(e_msg)
-            logging.error("This usually means a serious setup error.")
-            logging.error("Please verify if your data dir contains the "
-                          "expected directory structure")
-            logging.error("Backing data dir: %s",
-                          data_dir.get_backing_data_dir())
-            logging.error("Directory structure:")
-            for root, _, _ in os.walk(data_dir.get_backing_data_dir()):
-                logging.error(root)
+        if (params.get("image_backend", "filesystem") != "filesystem"):
+            image_dirname = os.path.dirname(self.image_filename)
+            if image_dirname and not os.path.isdir(image_dirname):
+                e_msg = ("Parent directory of the image file %s does "
+                         "not exist" % self.image_filename)
+                logging.error(e_msg)
+                logging.error("This usually means a serious setup error.")
+                logging.error("Please verify if your data dir contains the "
+                              "expected directory structure")
+                logging.error("Backing data dir: %s",
+                              data_dir.get_backing_data_dir())
+                logging.error("Directory structure:")
+                for root, _, _ in os.walk(data_dir.get_backing_data_dir()):
+                    logging.error(root)
 
-            logging.warning("We'll try to proceed by creating the dir. "
-                            "Other errors may ensue")
-            os.makedirs(image_dirname)
+                logging.warning("We'll try to proceed by creating the dir. "
+                                "Other errors may ensue")
+                os.makedirs(image_dirname)
 
         msg = "Create image by command: %s" % qemu_img_cmd
         error.context(msg, logging.info)
@@ -322,6 +334,17 @@ class QemuImg(storage.QemuImg):
             output = None
         return output
 
+    def get_format(self):
+        """
+        Get the fimage file format.
+        """
+        image_info = self.info()
+        if image_info:
+            image_format = re.findall("file format: (\w+)", image_info)[0]
+        else:
+            image_format = None
+        return image_format
+
     def support_cmd(self, cmd):
         """
         Verifies whether qemu-img supports command cmd.
@@ -337,18 +360,13 @@ class QemuImg(storage.QemuImg):
 
         return supports_cmd
 
-    def compare_images(self, image1, image2):
+    def compare_images(self, image1, image2, verbose=True):
         """
         Compare 2 images using the appropriate tools for each virt backend.
 
-        :param params: Dictionary containing the test parameters.
-        :param root_dir: Base directory for relative filenames.
-
-        :note: params should contain:
-               image_name -- the name of the image file, without extension
-               image_format -- the format of the image (qcow2, raw etc)
-
-        :raise VMImageCheckError: In case qemu-img check fails on the image.
+        :param image1: image path of first image
+        :param image2: image path of second image
+        :param verbose: Record output in debug file or not
         """
         compare_images = self.support_cmd("compare")
         if not compare_images:
@@ -358,6 +376,9 @@ class QemuImg(storage.QemuImg):
             logging.info("Comparing images %s and %s", image1, image2)
             compare_cmd = "%s compare %s %s" % (self.image_cmd, image1, image2)
             rv = utils.run(compare_cmd, ignore_status=True)
+
+            if verbose:
+                logging.debug("Output from command: %s" % rv.stdout)
 
             if rv.exit_status == 0:
                 logging.info("Compared images are equal")
@@ -383,7 +404,8 @@ class QemuImg(storage.QemuImg):
         logging.debug("Checking image file %s", image_filename)
         qemu_img_cmd = self.image_cmd
         image_is_checkable = self.image_format in ['qcow2', 'qed']
-        if os.path.exists(image_filename) and image_is_checkable:
+
+        if storage.file_exists(params, image_filename) and image_is_checkable:
             check_img = self.support_cmd("check") and self.support_cmd("info")
             if not check_img:
                 logging.debug("Skipping image check "
@@ -435,7 +457,7 @@ class QemuImg(storage.QemuImg):
                 if params.get("backup_image", "no") == "yes":
                     self.backup_image(params, root_dir, "backup", True, True)
         else:
-            if not os.path.exists(image_filename):
+            if not storage.file_exists(params, image_filename):
                 logging.debug("Image file %s not found, skipping check",
                               image_filename)
             elif not image_is_checkable:
@@ -482,3 +504,32 @@ class Iscsidev(storage.Iscsidev):
                     os.unlink(self.emulated_image)
                 else:
                     logging.debug("File %s not found", self.emulated_image)
+
+
+class LVMdev(storage.LVMdev):
+
+    """
+    Class for handle lvm devices for VM
+    """
+
+    def __init__(self, params, root_dir, tag):
+        """
+        Init the default value for image object.
+
+        @param params: Dictionary containing the test parameters.
+        @param root_dir: Base directory for relative filenames.
+        @param tag: Image tag defined in parameter images
+        """
+        super(LVMdev, self).__init__(params, root_dir, tag)
+
+    def setup(self):
+        """
+        Get logical volume path;
+        """
+        return self.lvmdevice.setup()
+
+    def cleanup(self):
+        """
+        Cleanup useless volumes;
+        """
+        return self.lvmdevice.cleanup()

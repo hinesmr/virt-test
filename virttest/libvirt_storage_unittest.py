@@ -1,15 +1,10 @@
 #!/usr/bin/python
 import unittest
 
-try:
-    import autotest.common as common
-except ImportError:
-    import common
-
+import common
 from autotest.client.utils import CmdResult
-from virttest import libvirt_storage, virsh
-
-VIRSH_EXEC = virsh.VIRSH_EXEC
+import libvirt_storage
+from virsh_unittest import FakeVirshFactory
 
 # The output of virsh.pool_list with only default pool
 _DEFAULT_POOL = ("Name                 State      Autostart\n"
@@ -88,11 +83,8 @@ class PoolTestBase(unittest.TestCase):
 
     def setUp(self):
         # To avoid not installed libvirt packages
-        self.bogus_virsh = virsh.Virsh(virsh_exec=virsh.VIRSH_EXEC,
-                                       uri='qemu:///system', debug=True,
-                                       ignore_status=True)
-
-        # Use defined virsh methods above
+        self.bogus_virsh = FakeVirshFactory()
+        # Use defined virsh methods needed in this unittest
         self.bogus_virsh.__super_set__('pool_list', self._pool_list)
         self.bogus_virsh.__super_set__('pool_info', self._pool_info)
         self.bogus_virsh.__super_set__('pool_define_as', self._pool_define_as)
@@ -108,9 +100,9 @@ class ExistPoolTest(PoolTestBase):
 
     def test_exist_pool(self):
         pools = self.sp.list_pools()
-        self.assertIsInstance(pools, dict)
+        assert isinstance(pools, dict)
         # Test pool_state
-        self.assertIn(self.sp.pool_state("default"), ['active', 'inactive'])
+        self.assertTrue(self.sp.pool_state("default") in ['active', 'inactive'])
         # Test pool_info
         self.assertNotEqual(self.sp.pool_info("default"), {})
 
@@ -136,7 +128,7 @@ class NotExpectedPoolTest(PoolTestBase):
 
     def test_not_exist_pool(self):
         self.assertFalse(self.sp.pool_exists("NOTEXISTPOOL"))
-        self.assertIsNone(self.sp.pool_state("NOTEXISTPOOL"))
+        assert self.sp.pool_state("NOTEXISTPOOL") is None
         self.assertEqual(self.sp.pool_info("NOTEXISTPOOL"), {})
 
 

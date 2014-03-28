@@ -32,6 +32,11 @@ import urllib
 import shutil
 import unittest
 import tempfile
+
+autotest_dir = os.environ.get('AUTOTEST_PATH')
+if autotest_dir is not None:
+    sys.path.insert(0, autotest_dir)
+
 try:
     import autotest.common as common
 except ImportError:
@@ -44,8 +49,6 @@ import reindent
 import run_pep8
 
 UTILS_DIRNAME = os.path.dirname(sys.modules[__name__].__file__)
-TOP_LEVEL_DIRNAME = os.path.abspath(os.path.dirname(UTILS_DIRNAME))
-CODESPELL_PATH = os.path.join(UTILS_DIRNAME, 'codespell', 'codespell.py')
 
 # Hostname of patchwork server to use
 PWHOST = "patchwork.virt.bos.redhat.com"
@@ -64,12 +67,12 @@ def license_project_name(path):
     try:
         license_file = file(os.path.join(path, 'LICENSE'), 'r')
         first_word = license_file.readline().strip().split()[0].lower()
-        return first_word
+        return first_word, path
     except IOError:
         # Recurse search parent of path's directory
         return license_project_name(os.path.dirname(path))
 
-PROJECT_NAME = license_project_name(os.path.dirname(os.path.abspath(__file__)))
+PROJECT_NAME, TOP_LEVEL_DIRNAME = license_project_name(os.getcwd())
 
 
 EXTENSION_BLACKLIST = {
@@ -137,9 +140,9 @@ class VCS(object):
             self.backend = None
 
     def guess_vcs_name(self):
-        if os.path.isdir(".svn"):
+        if os.path.isdir(os.path.join(TOP_LEVEL_DIRNAME, ".svn")):
             return "SVN"
-        elif os.path.exists(".git"):
+        elif os.path.exists(os.path.join(TOP_LEVEL_DIRNAME, ".git")):
             return "git"
         else:
             logging.error("Could not figure version control system. Are you "
@@ -358,7 +361,7 @@ class GitBackend(object):
 
         :param patch: Path to the patch file.
         """
-        utils.run("git checkout next")
+        utils.run("git checkout master")
         utils.run("git checkout -b %s" %
                   os.path.basename(patch).rstrip(".patch"))
         try:
@@ -373,14 +376,6 @@ class GitBackend(object):
             utils.system("git pull")
         except error.CmdError, e:
             logging.error("git tree update failed: %s" % e)
-
-
-def run_codespell(path):
-    cmd = CODESPELL_PATH
-    cmd += " --skip='tools/codespell/*,*.pyc,*.pyo,*.png,*.gz,*.bmp,*.exe,'"
-    cmd += " --write-changes --quiet-level=3 "
-    cmd += path
-    utils.system(cmd, ignore_status=True)
 
 
 class FileChecker(object):
@@ -501,12 +496,7 @@ class FileChecker(object):
 
         path = self._get_checked_filename()
 
-        try:
-            if run_pylint.check_file(path):
-                success = False
-        except Exception, details:
-            logging.error("Pylint exception while verifying %s, details: %s",
-                          path, details)
+        if run_pylint.check_file(path):
             success = False
 
         return success
@@ -531,21 +521,6 @@ class FileChecker(object):
                 "PEP8 linter exception while verifying %s, details: %s",
                 path, details)
             success = False
-
-        return success
-
-    def _check_codespell(self):
-        """
-        Verifies the file with codespell.
-        """
-        success = True
-        for exc in self.check_exceptions:
-            if re.search(exc, self.path):
-                return success
-
-        path = self._get_checked_filename()
-
-        run_codespell(path)
 
         return success
 
@@ -620,8 +595,6 @@ class FileChecker(object):
             if not self._check_code():
                 success = False
             if not self._check_pep8():
-                success = False
-            if not self._check_codespell():
                 success = False
             if not skip_unittest:
                 if not self._check_unittest():
@@ -808,9 +781,6 @@ if __name__ == "__main__":
     if full_check:
         failed_paths = []
         run_pylint.set_verbosity(False)
-        logging.info("%s spell check", PROJECT_NAME)
-        logging.info("")
-        run_codespell(TOP_LEVEL_DIRNAME)
 
         logging.info("%s full tree check", PROJECT_NAME)
         logging.info("")

@@ -12,6 +12,7 @@ import re
 import commands
 from autotest.client.shared import error
 from autotest.client import utils
+from virttest.qemu_devices import qdevices, qcontainer
 import utils_misc
 import virt_vm
 import test_setup
@@ -22,7 +23,6 @@ import qemu_virtio_port
 import remote
 import data_dir
 import utils_net
-import qemu_devices
 
 
 class QemuSegFaultError(virt_vm.VMError):
@@ -68,6 +68,13 @@ class ImageUnbootableError(virt_vm.VMError):
                 " check your boot disk image file." % self.name)
 
 
+def clean_tmp_files():
+    if os.path.isfile(CREATE_LOCK_FILENAME):
+        os.unlink(CREATE_LOCK_FILENAME)
+
+CREATE_LOCK_FILENAME = os.path.join('/tmp', 'virt-test-vm-create.lock')
+
+
 class VM(virt_vm.BaseVM):
 
     """
@@ -101,6 +108,7 @@ class VM(virt_vm.BaseVM):
             self.__dict__ = state
         else:
             self.process = None
+            self.serial_ports = []
             self.serial_console = None
             self.redirs = {}
             self.spice_options = {}
@@ -112,10 +120,14 @@ class VM(virt_vm.BaseVM):
             self.vcpu_threads = []
             self.vhost_threads = []
             self.devices = None
+            self.logs = {}
+            self.remote_sessions = []
+            self.logsessions = {}
 
         self.name = name
         self.params = params
         self.root_dir = root_dir
+        self.ip_version = self.params.get("ip_version", "ipv4")
         self.address_cache = address_cache
         self.index_in_use = {}
         # This usb_dev_dict member stores usb controller and device info,
@@ -129,8 +141,6 @@ class VM(virt_vm.BaseVM):
         # }
         # This structure can used in usb hotplug/unplug test.
         self.usb_dev_dict = {}
-        self.logs = {}
-        self.logsessions = {}
         self.driver_type = 'qemu'
         self.params['driver_type_' + self.name] = self.driver_type
         # virtnet init depends on vm_type/driver_type being set w/in params
@@ -280,6 +290,19 @@ class VM(virt_vm.BaseVM):
         """
         return [self.get_serial_console_filename(_) for _ in
                 self.params.objects("isa_serials")]
+
+    def cleanup_serial_console(self):
+        """
+        Close serial console and associated log file
+        """
+        if self.serial_console is not None:
+            self.serial_console.close()
+            self.serial_console = None
+        if hasattr(self, "migration_file"):
+            try:
+                os.unlink(self.migration_file)
+            except OSError:
+                pass
 
     def make_create_command(self, name=None, params=None, root_dir=None):
         """
@@ -472,7 +495,7 @@ class VM(virt_vm.BaseVM):
             vioser_id = "anacondalog_vioser_%s" % self.instance
             filename = "/tmp/anaconda-%s" % self.instance
             self.logs["anaconda"] = filename
-            dev = qemu_devices.QCustomDevice('chardev', backend='backend')
+            dev = qdevices.QCustomDevice('chardev', backend='backend')
             dev.set_param('backend', 'socket')
             dev.set_param('id', chardev_id)
             dev.set_param("path", filename)
@@ -512,7 +535,7 @@ class VM(virt_vm.BaseVM):
                 elif model == "virtio":
                     model = "virtio-net-pci"
                 dev = QDevice(model)
-                dev.set_param('mac', mac)
+                dev.set_param('mac', mac, dynamic=True)
                 # only pci domain=0,bus=0,function=0 is supported for now.
                 #
                 # libvirt gains the pci_slot, free_pci_addr here,
@@ -528,10 +551,10 @@ class VM(virt_vm.BaseVM):
                         dev.set_param(key, val)
                 dev.set_param("bootindex", bootindex)
             else:
-                dev = qemu_devices.QCustomDevice('net', backend='type')
+                dev = qdevices.QCustomDevice('net', backend='type')
                 dev.set_param('type', 'nic')
                 dev.set_param('model', model)
-                dev.set_param('macaddr', mac, 'NEED_QUOTE')
+                dev.set_param('macaddr', mac, 'NEED_QUOTE', True)
             dev.set_param('id', device_id, 'NEED_QUOTE')
             if "virtio" in model:
                 if int(queues) > 1:
@@ -556,50 +579,69 @@ class VM(virt_vm.BaseVM):
             else:
                 logging.warning("Unknown/unsupported nettype %s" % nettype)
                 return ''
+
             if devices.has_option("netdev"):
                 cmd = " -netdev %s,id=%s" % (mode, netdev_id)
+                cmd_nd = cmd
                 if vhost:
-                    cmd += ",%s" % vhost
+                    if vhost in ["on", "off"]:
+                        cmd += ",vhost=%s" % vhost
+                    elif vhost == "vhost=on":  # Keeps compatibility with old.
+                        cmd += ",%s" % vhost
+                    cmd_nd = cmd
                     if vhostfds:
                         if (int(queues) > 1 and
                            'vhostfds=' in devices.get_help_text()):
-                            cmd += ",vhostfds=%s" % vhostfds
+                            cmd += ",vhostfds=%(vhostfds)s"
+                            cmd_nd += ",vhostfds=DYN"
                         else:
                             txt = ""
                             if int(queues) > 1:
                                 txt = "qemu do not support vhost multiqueue,"
                                 txt += " Fall back to single queue."
                             if 'vhostfd=' in devices.get_help_text():
-                                cmd += ",vhostfd=%s" % vhostfds.split(":")[0]
+                                cmd += ",vhostfd=%(vhostfd)s"
+                                cmd_nd += ",vhostfd=DYN"
                             else:
                                 txt += " qemu do not support vhostfd."
                             if txt:
                                 logging.warn(txt)
                 if netdev_extra_params:
                     cmd += "%s" % netdev_extra_params
+                    cmd_nd += "%s" % netdev_extra_params
             else:
                 cmd = " -net %s,vlan=%d" % (mode, vlan)
-            if mode == "tap" and tapfds:
-                if (int(queues)) > 1 and ',fds=' in devices.get_help_text():
-                    cmd += ",fds=%s" % tapfds
-                else:
-                    cmd += ",fd=%s" % tapfds
+                cmd_nd = cmd
+            if mode == "tap":
+                if script:
+                    cmd += ",script='%s'" % script
+                    cmd += ",downscript='%s'" % (downscript or "no")
+                    cmd_nd = cmd
+                    if ifname:
+                        cmd += ",ifname='%s'" % ifname
+                        cmd_nd = cmd
+                elif tapfds:
+                    if (int(queues) > 1 and
+                       ',fds=' in devices.get_help_text()):
+                        cmd += ",fds=%(tapfds)s"
+                        cmd_nd += ",fds=DYN"
+                    else:
+                        cmd += ",fd=%(tapfd)s"
+                        cmd_nd += ",fd=DYN"
             elif mode == "user":
                 if tftp and "[,tftp=" in devices.get_help_text():
                     cmd += ",tftp='%s'" % tftp
+                    cmd_nd = cmd
                 if bootfile and "[,bootfile=" in devices.get_help_text():
                     cmd += ",bootfile='%s'" % bootfile
+                    cmd_nd = cmd
                 if "[,hostfwd=" in devices.get_help_text():
-                    for host_port, guest_port in hostfwd:
-                        cmd += ",hostfwd=tcp::%s-:%s" % (host_port, guest_port)
-            else:
-                if ifname:
-                    cmd += ",ifname='%s'" % ifname
-                if script:
-                    cmd += ",script='%s'" % script
-                cmd += ",downscript='%s'" % (downscript or "no")
+                    for i in xrange(len(hostfwd)):
+                        cmd += (",hostfwd=tcp::%%(host_port%d)s"
+                                "-:%%(guest_port%d)s" % (i, i))
+                        cmd_nd += ",hostfwd=tcp::DYN-:%%(guest_port)ds"
 
-            return cmd
+            return cmd, cmd_nd
 
         def add_floppy(devices, filename, index):
             cmd_list = [" -fda '%s'", " -fdb '%s'"]
@@ -648,20 +690,11 @@ class VM(virt_vm.BaseVM):
 
         def add_pcidevice(devices, host, params, device_driver="pci-assign",
                           pci_bus='pci.0'):
-            if device_driver == "pci-assign":
-                if (devices.has_device("pci-assign") or
-                   devices.has_device("kvm-pci-assign")):
-                    dev = QDevice(device_driver, parent_bus=pci_bus)
-                else:
-                    dev = qemu_devices.QCustomDevice('pcidevice',
-                                                     parent_bus=pci_bus)
+            if devices.has_device(device_driver):
+                dev = QDevice(device_driver, parent_bus=pci_bus)
             else:
-                if devices.has_device(device_driver):
-                    dev = QDevice(device_driver, parent_bus=pci_bus)
-                else:
-                    dev = qemu_devices.QCustomDevice('pcidevice',
-                                                     parent_bus=pci_bus)
-            help_cmd = "%s -device pci-assign,\\? 2>&1" % qemu_binary
+                dev = qdevices.QCustomDevice('pcidevice', parent_bus=pci_bus)
+            help_cmd = "%s -device %s,\\? 2>&1" % (qemu_binary, device_driver)
             pcidevice_help = utils.system_output(help_cmd)
             dev.set_param('host', host)
             dev.set_param('id', 'id_%s' % host.replace(":", "."))
@@ -669,14 +702,14 @@ class VM(virt_vm.BaseVM):
             for param in params.get("pci-assign_params", "").split():
                 value = params.get(param)
                 if value:
-                    if bool(re.search(param, pcidevice_help, re.M)):
+                    if param in pcidevice_help:
                         dev.set_param(param, value)
                     else:
                         fail_param.append(param)
             if fail_param:
                 msg = ("parameter %s is not support in device pci-assign."
                        " It only support following parameter:\n %s" %
-                       (param, pcidevice_help))
+                       (", ".join(fail_param), pcidevice_help))
                 logging.warn(msg)
             devices.insert(dev)
 
@@ -1050,22 +1083,22 @@ class VM(virt_vm.BaseVM):
         # Add numa memory cmd to pin guest memory to numa node
         if params.get("numa_node"):
             numa_node = int(params.get("numa_node"))
-            if numa_node < 0:
-                p = utils_misc.NumaNode(numa_node)
-                n = int(utils_misc.get_node_count()) + numa_node
-                cmd += "numactl -m %s " % n
+            if len(utils_misc.get_node_cpus()) < int(params.get("smp", 1)):
+                logging.info("Skip pinning, no enough nodes")
+            elif numa_node < 0:
+                n = utils_misc.NumaNode(numa_node)
+                cmd += "numactl -m %s " % n.node_id
             else:
                 n = numa_node - 1
                 cmd += "numactl -m %s " % n
 
         # Start constructing devices representation
-        devices = qemu_devices.DevContainer(qemu_binary, self.name,
-                                            params.get('strict_mode'),
-                                            params.get(
-                                                'workaround_qemu_qmp_crash'),
-                                            params.get('allow_hotplugged_vm'))
-        StrDev = qemu_devices.QStringDevice
-        QDevice = qemu_devices.QDevice
+        devices = qcontainer.DevContainer(qemu_binary, self.name,
+                                          params.get('strict_mode'),
+                                          params.get('workaround_qemu_qmp_crash'),
+                                          params.get('allow_hotplugged_vm'))
+        StrDev = qdevices.QStringDevice
+        QDevice = qdevices.QDevice
 
         devices.insert(StrDev('PREFIX', cmdline=cmd))
         # Add the qemu binary
@@ -1290,11 +1323,11 @@ class VM(virt_vm.BaseVM):
                     tftp = None
                 nettype = nic.get("nettype", "bridge")
                 # don't force conversion add_nic()/add_net() optional parameter
-                if nic.has_key('tapfds'):
+                if 'tapfds' in nic:
                     tapfds = nic.tapfds
                 else:
                     tapfds = None
-                if nic.has_key('vhostfds'):
+                if 'vhostfds' in nic:
                     vhostfds = nic.vhostfds
                 else:
                     vhostfds = None
@@ -1303,10 +1336,10 @@ class VM(virt_vm.BaseVM):
                 # specify the number of MSI-X vectors that the card should have;
                 # this option currently only affects virtio cards
                 if nic_params.get("enable_msix_vectors") == "yes":
-                    if nic.has_key("vectors"):
+                    if "vectors" in nic:
                         vectors = nic.vectors
                     else:
-                        vectors = 2 * int(queues) + 1
+                        vectors = 2 * int(queues) + 2
                 else:
                     vectors = None
 
@@ -1317,15 +1350,36 @@ class VM(virt_vm.BaseVM):
                         bootindex, queues, vectors, pci_bus)
 
                 # Handle the '-net tap' or '-net user' or '-netdev' part
-                cmd = add_net(devices, vlan, nettype, ifname, tftp,
-                              bootp, redirs, netdev_id, netdev_extra,
-                              tapfds, script, downscript, vhost, queues,
-                              vhostfds)
+                cmd, cmd_nd = add_net(devices, vlan, nettype, ifname, tftp,
+                                      bootp, redirs, netdev_id, netdev_extra,
+                                      tapfds, script, downscript, vhost,
+                                      queues, vhostfds)
+
+                if vhostfds is None:
+                    vhostfds = ""
+
+                if tapfds is None:
+                    tapfds = ""
+
+                net_params = {'netdev_id': netdev_id,
+                              'vhostfd': vhostfds.split(":")[0],
+                              'vhostfds': vhostfds,
+                              'tapfd': tapfds.split(":")[0],
+                              'tapfds': tapfds,
+                              'ifname': ifname,
+                              }
+
+                for i, (host_port, guest_port) in enumerate(redirs):
+                    net_params["host_port%d" % i] = host_port
+                    net_params["guest_port%d" % i] = guest_port
+
                 # TODO: Is every NIC a PCI device?
-                devices.insert(StrDev("NET-%s" % nettype, cmdline=cmd))
+                devices.insert(StrDev("NET-%s" % nettype, cmdline=cmd,
+                                      params=net_params, cmdline_nd=cmd_nd))
             else:
                 device_driver = nic_params.get("device_driver", "pci-assign")
                 pci_id = vm.pa_pci_ids[iov]
+                pci_id = ":".join(pci_id.split(":")[1:])
                 add_pcidevice(devices, pci_id, params=nic_params,
                               device_driver=device_driver,
                               pci_bus=pci_bus)
@@ -1694,8 +1748,9 @@ class VM(virt_vm.BaseVM):
 
     def _nic_tap_add_helper(self, nic):
         if nic.nettype == 'macvtap':
-            logging.info("Adding macvtap ifname: %s", nic.ifname)
-            utils_net.add_nic_macvtap(nic)
+            macvtap_mode = self.params.get("macvtap_mode", "vepa")
+            nic.tapfds = utils_net.create_and_open_macvtap(nic.ifname,
+                                                           macvtap_mode, nic.queues, nic.netdst, nic.mac)
         else:
             nic.tapfds = utils_net.open_tap("/dev/net/tun", nic.ifname,
                                             queues=nic.queues, vnet_hdr=True)
@@ -1703,7 +1758,7 @@ class VM(virt_vm.BaseVM):
                           self.name, nic.ifname, nic.netdst)
             if nic.nettype == 'bridge':
                 utils_net.add_to_bridge(nic.ifname, nic.netdst)
-            utils_net.bring_up_ifname(nic.ifname)
+        utils_net.bring_up_ifname(nic.ifname)
 
     def _nic_tap_remove_helper(self, nic):
         try:
@@ -1726,6 +1781,88 @@ class VM(virt_vm.BaseVM):
                         utils_net.del_from_bridge(nic.ifname, nic.netdst)
         except TypeError:
             pass
+
+    def create_serial_console(self):
+        """
+        Establish a session with the serial console.
+
+        Let's consider the first serial port as serial console.
+        Note: requires a version of netcat that supports -U
+        """
+        try:
+            tmp_serial = self.serial_ports[0]
+        except IndexError:
+            raise virt_vm.VMConfigMissingError(self.name, "isa_serial")
+
+        self.serial_console = aexpect.ShellSession(
+            "nc -U %s" % self.get_serial_console_filename(tmp_serial),
+            auto_close=False,
+            output_func=utils_misc.log_line,
+            output_params=("serial-%s-%s.log" % (tmp_serial, self.name),),
+            prompt=self.params.get("shell_prompt", "[\#\$]"))
+        del tmp_serial
+
+    def update_system_dependent_devs(self):
+        # Networking
+        devices = self.devices
+        params = self.params
+        redirs = []
+        for redir_name in params.objects("redirs"):
+            redir_params = params.object_params(redir_name)
+            guest_port = int(redir_params.get("guest_port"))
+            host_port = self.redirs.get(guest_port)
+            redirs += [(host_port, guest_port)]
+
+        for nic in self.virtnet:
+            nic_params = params.object_params(nic.nic_name)
+            if nic_params.get('pci_assignable') == "no":
+                script = nic_params.get("nic_script")
+                downscript = nic_params.get("nic_downscript")
+                script_dir = data_dir.get_data_dir()
+                if script:
+                    script = utils_misc.get_path(script_dir, script)
+                if downscript:
+                    downscript = utils_misc.get_path(script_dir,
+                                                     downscript)
+                # setup nic parameters as needed
+                # add_netdev if netdev_id not set
+                nic = self.add_nic(**dict(nic))
+                # gather set values or None if unset
+                netdev_id = nic.get('netdev_id')
+                # don't force conversion add_nic()/add_net() optional
+                # parameter
+                if 'tapfds' in nic:
+                    tapfds = nic.tapfds
+                else:
+                    tapfds = ""
+                if 'vhostfds' in nic:
+                    vhostfds = nic.vhostfds
+                else:
+                    vhostfds = ""
+                ifname = nic.get('ifname')
+                # specify the number of MSI-X vectors that the card should
+                # have this option currently only affects virtio cards
+
+                net_params = {'netdev_id': netdev_id,
+                              'vhostfd': vhostfds.split(":")[0],
+                              'vhostfds': vhostfds,
+                              'tapfd': tapfds.split(":")[0],
+                              'tapfds': tapfds,
+                              'ifname': ifname,
+                              }
+
+                for i, (host_port, guest_port) in enumerate(redirs):
+                    net_params["host_port%d" % i] = host_port
+                    net_params["guest_port%d" % i] = guest_port
+
+                # TODO: Is every NIC a PCI device?
+                devs = devices.get_by_params({'netdev_id': netdev_id})
+                # TODO: Is every NIC a PCI device?
+                if len(devs) > 1:
+                    logging.error("There are %d devices with netdev_id %s."
+                                  " This shouldn't happens." % (len(devs),
+                                                                netdev_id))
+                devs[0].params.update(net_params)
 
     @error.context_aware
     def create(self, name=None, params=None, root_dir=None,
@@ -1788,7 +1925,9 @@ class VM(virt_vm.BaseVM):
                 if not os.path.exists(iso):
                     raise virt_vm.VMImageMissingError(iso)
                 compare = False
-                if cdrom_params.get("md5sum_1m"):
+                if cdrom_params.get("skip_hash"):
+                    logging.debug("Skipping hash comparison")
+                elif cdrom_params.get("md5sum_1m"):
                     logging.debug("Comparing expected MD5 sum with MD5 sum of "
                                   "first MB of ISO file...")
                     actual_hash = utils.hash_file(iso, 1048576, method="md5")
@@ -1815,7 +1954,7 @@ class VM(virt_vm.BaseVM):
 
         # Make sure the following code is not executed by more than one thread
         # at the same time
-        lockfile = open("/tmp/kvm-autotest-vm-create.lock", "w+")
+        lockfile = open(CREATE_LOCK_FILENAME, "w+")
         fcntl.lockf(lockfile, fcntl.LOCK_EX)
 
         try:
@@ -1836,6 +1975,12 @@ class VM(virt_vm.BaseVM):
 
             if self.redirs != old_redirs:
                 self.devices = None
+
+            # Update the network related parameters as well to conform to
+            # expected behavior on VM creation
+            getattr(self, 'virtnet').__init__(self.params,
+                                              self.name,
+                                              self.instance)
 
             # Generate basic parameter values for all NICs and create TAP fd
             for nic in self.virtnet:
@@ -1859,7 +2004,8 @@ class VM(virt_vm.BaseVM):
                     # Virtual Functions (VF) assignable devices
                     if pa_type == "vf":
                         self.pci_assignable.add_device(device_type=pa_type,
-                                                       mac=mac)
+                                                       mac=mac,
+                                                       name=nic_params.get("device_name"))
                     # Physical NIC (PF) assignable devices
                     elif pa_type == "pf":
                         self.pci_assignable.add_device(device_type=pa_type,
@@ -1873,22 +2019,28 @@ class VM(virt_vm.BaseVM):
                     if nic_params.get('netdst') == 'private':
                         nic.netdst = (test_setup.
                                       PrivateBridgeConfig(nic_params).brname)
+
                     nic = self.add_nic(**dict(nic))  # implied add_netdev
+
                     if mac_source:
                         # Will raise exception if source doesn't
                         # have cooresponding nic
                         logging.debug("Copying mac for nic %s from VM %s"
                                       % (nic.nic_name, mac_source.name))
                         nic.mac = mac_source.get_mac_address(nic.nic_name)
+
                     if nic.ifname in utils_net.get_net_if():
                         self.virtnet.generate_ifname(nic.nic_name)
-                    elif (utils_net.find_current_bridge(nic.ifname)[1]
-                            == nic.netdst):
+                    elif (utils_net.find_current_bridge(nic.ifname)[1] ==
+                          nic.netdst):
                         utils_net.del_from_bridge(nic.ifname, nic.netdst)
 
                     if nic.nettype in ['bridge', 'network', 'macvtap']:
                         self._nic_tap_add_helper(nic)
-                    if ((nic_params.get("vhost") == 'vhost=on') and
+
+                    if ((nic_params.get("vhost") in ['on',
+                                                     'force',
+                                                     'vhost=on']) and
                             (nic_params.get("enable_vhostfd", "yes") == "yes")):
                         vhostfds = []
                         for i in xrange(int(nic.queues)):
@@ -1899,6 +2051,7 @@ class VM(virt_vm.BaseVM):
                         logging.info("Assuming dependencies met for "
                                      "user mode nic %s, and ready to go"
                                      % nic.nic_name)
+
                     self.virtnet.update_db()
 
             # Find available VNC port, if needed
@@ -1920,6 +2073,9 @@ class VM(virt_vm.BaseVM):
                 else:
                     raise virt_vm.VMPAError(pa_type)
 
+            if (name is None and params is None and root_dir is None
+                    and self.devices is not None):
+                self.update_system_dependent_devs()
             # Make qemu command
             try:
                 self.devices = self.make_create_command()
@@ -1985,22 +2141,28 @@ class VM(virt_vm.BaseVM):
                 proxy_helper_cmd += " -n"
 
                 logging.info("Running Proxy Helper:\n%s", proxy_helper_cmd)
-                self.process = aexpect.run_bg(proxy_helper_cmd, None,
-                                              logging.info,
-                                              "[9p proxy helper]",
-                                              auto_close=False)
+                self.process = aexpect.run_tail(proxy_helper_cmd,
+                                                None,
+                                                logging.info,
+                                                "[9p proxy helper]",
+                                                auto_close=False)
+            else:
+                logging.info("Running qemu command (reformatted):\n%s",
+                             qemu_command.replace(" -", " \\\n    -"))
+                self.qemu_command = qemu_command
+                self.process = aexpect.run_tail(qemu_command,
+                                                None,
+                                                logging.info,
+                                                "[qemu output] ",
+                                                auto_close=False)
 
-            logging.info("Running qemu command (reformatted):\n%s",
-                         qemu_command.replace(" -", " \\\n    -"))
-            self.qemu_command = qemu_command
-            self.process = aexpect.run_bg(qemu_command, None,
-                                          logging.info, "[qemu output] ",
-                                          auto_close=False)
+            logging.info("Created qemu process with parent PID %d",
+                         self.process.get_pid())
             self.start_time = time.time()
 
             # test doesn't need to hold tapfd's open
             for nic in self.virtnet:
-                if nic.has_key('tapfds'):  # implies bridge/tap
+                if 'tapfds' in nic:  # implies bridge/tap
                     try:
                         for i in nic.tapfds.split(':'):
                             os.close(int(i))
@@ -2012,13 +2174,21 @@ class VM(virt_vm.BaseVM):
                     # File descriptor is already closed
                     except OSError:
                         pass
-                if nic.has_key('vhostfds'):
+                if 'vhostfds' in nic:
                     try:
                         for i in nic.vhostfds.split(':'):
                             os.close(int(i))
                         del nic['vhostfds']
                     except OSError:
                         pass
+
+            # Make sure qemu is not defunct
+            if self.process.is_defunct():
+                logging.error("Bad things happened, qemu process is defunct")
+                err = ("Qemu is defunct.\nQemu output:\n%s"
+                       % self.process.get_output())
+                self.destroy()
+                raise virt_vm.VMStartError(self.name, err)
 
             # Make sure the process was started successfully
             if not self.process.is_alive():
@@ -2049,7 +2219,6 @@ class VM(virt_vm.BaseVM):
                 self.monitors += [monitor]
 
             # Create isa serial ports.
-            self.serial_ports = []
             for serial in params.objects("isa_serials"):
                 self.serial_ports.append(serial)
 
@@ -2103,21 +2272,7 @@ class VM(virt_vm.BaseVM):
                                               r"\w+\s+(\d+)\s.*\[vhost-%s\]")
             self.vhost_threads = self.get_vhost_threads(vhost_thread_pattern)
 
-            # Establish a session with the serial console
-            # Let's consider the first serial port as serial console.
-            # Note: requires a version of netcat that supports -U
-            try:
-                tmp_serial = self.serial_ports[0]
-            except IndexError:
-                raise virt_vm.VMConfigMissingError(name, "isa_serial")
-
-            self.serial_console = aexpect.ShellSession(
-                "nc -U %s" % self.get_serial_console_filename(tmp_serial),
-                auto_close=False,
-                output_func=utils_misc.log_line,
-                output_params=("serial-%s-%s.log" % (tmp_serial, name),),
-                prompt=self.params.get("shell_prompt", "[\#\$]"))
-            del tmp_serial
+            self.create_serial_console()
 
             for key, value in self.logs.items():
                 outfile = "%s-%s.log" % (key, name)
@@ -2139,6 +2294,11 @@ class VM(virt_vm.BaseVM):
                             logging.debug("Migration did not start yet...")
                         else:
                             raise e
+
+            # Update mac and IP info for assigned device
+            # NeedFix: Can we find another way to get guest ip?
+            if params.get("mac_changeable") == "yes":
+                utils_net.update_mac_ip_address(self, params)
 
         finally:
             fcntl.lockf(lockfile, fcntl.LOCK_UN)
@@ -2328,8 +2488,12 @@ class VM(virt_vm.BaseVM):
                 logging.debug("Ending VM %s process (monitor)", self.name)
                 try:
                     self.monitor.quit()
-                except qemu_monitor.MonitorError, e:
+                except Exception, e:
                     logging.warn(e)
+                    if self.is_dead():
+                        logging.warn("VM %s down during try to kill it "
+                                     "by monitor", self.name)
+                        return
                 else:
                     # Wait for the VM to be really dead
                     if self.wait_until_dead(5, 0.5, 0.5):
@@ -2566,6 +2730,8 @@ class VM(virt_vm.BaseVM):
         nic_index = self.virtnet.nic_name_index(nic_name)
         nic.set_if_none('netdev_id', utils_misc.generate_random_id())
         nic.set_if_none('ifname', self.virtnet.generate_ifname(nic_index))
+        nic.set_if_none('netdev_extra_params',
+                        params.get('netdev_extra_params'))
         nic.set_if_none('nettype', 'bridge')
         if nic.nettype in ['bridge', 'macvtap']:  # implies tap
             # destination is required, hard-code reasonable default if unset
@@ -2621,7 +2787,7 @@ class VM(virt_vm.BaseVM):
         nic.set_if_none('nic_model', params['nic_model'])
         nic.set_if_none('queues', params.get('queues', '1'))
         if params.get("enable_msix_vectors") == "yes":
-            nic.set_if_none('vectors', 2 * int(nic.queues) + 1)
+            nic.set_if_none('vectors', 2 * int(nic.queues) + 2)
         return nic
 
     @error.context_aware
@@ -2634,7 +2800,6 @@ class VM(virt_vm.BaseVM):
         :raise:: IOError if TAP device node cannot be opened
         :raise:: VMAddNetDevError: if operation failed
         """
-        tapfds = []
         nic = self.virtnet[nic_index_or_name]
         error.context("Activating netdev for %s based on %s" %
                       (self.name, nic))
@@ -2642,28 +2807,41 @@ class VM(virt_vm.BaseVM):
                    (self.virtnet[nic_index_or_name], self.name))
 
         attach_cmd = "netdev_add"
-        if nic.nettype == 'bridge':  # implies tap
+        if nic.nettype in ['bridge', 'macvtap']:
             error.context("Opening tap device node for %s " % nic.ifname,
                           logging.debug)
-            python_tapfds = utils_net.open_tap("/dev/net/tun",
-                                               nic.ifname,
-                                               queues=nic.queues,
-                                               vnet_hdr=False)
+            if nic.nettype == "bridge":
+                tun_tap_dev = "/dev/net/tun"
+                python_tapfds = utils_net.open_tap(tun_tap_dev,
+                                                   nic.ifname,
+                                                   queues=nic.queues,
+                                                   vnet_hdr=False)
+            elif nic.nettype == "macvtap":
+                macvtap_mode = self.params.get("macvtap_mode", "vepa")
+                o_macvtap = utils_net.create_macvtap(nic.ifname, macvtap_mode,
+                                                     nic.netdst, nic.mac)
+                tun_tap_dev = o_macvtap.get_device()
+                python_tapfds = utils_net.open_macvtap(o_macvtap, nic.queues)
+
+            qemu_fds = "/proc/%s/fd" % self.get_pid()
+            openfd_list = os.listdir(qemu_fds)
             for i in range(int(nic.queues)):
                 error.context("Assigning tap %s to qemu by fd" %
                               nic.tapfd_ids[i], logging.info)
-                lsof_cmd = "lsof -a -p %s -Ff -- /dev/net/tun" % self.get_pid()
-                openfd_list = utils.system_output(lsof_cmd).splitlines()
                 self.monitor.getfd(int(python_tapfds.split(':')[i]),
                                    nic.tapfd_ids[i])
-                n_openfd_list = utils.system_output(lsof_cmd).splitlines()
-                new_qemu_fd = list(set(n_openfd_list) - set(openfd_list))
-                if not new_qemu_fd:
-                    err_msg = "Can't get the tap fd in qemu process!"
-                    raise virt_vm.VMAddNetDevError(err_msg)
-                tapfds.append(new_qemu_fd[0].lstrip("f"))
+            n_openfd_list = os.listdir(qemu_fds)
+            new_fds = list(set(n_openfd_list) - set(openfd_list))
 
-            nic.set_if_none("tapfds", ":".join(tapfds))
+            if not new_fds:
+                err_msg = "Can't get the fd that qemu process opened!"
+                raise virt_vm.VMAddNetDevError(err_msg)
+            qemu_tapfds = [fd for fd in new_fds if os.readlink(
+                           os.path.join(qemu_fds, fd)) == tun_tap_dev]
+            if not qemu_tapfds or len(qemu_tapfds) != int(nic.queues):
+                err_msg = "Can't get the tap fd in qemu process!"
+                raise virt_vm.VMAddNetDevError(err_msg)
+            nic.set_if_none("tapfds", ":".join(qemu_tapfds))
 
             if not self.devices:
                 err_msg = "Can't add nic for VM which is not running."
@@ -2678,13 +2856,11 @@ class VM(virt_vm.BaseVM):
             error.context("Raising interface for " + msg_sfx + attach_cmd,
                           logging.debug)
             utils_net.bring_up_ifname(nic.ifname)
-            error.context("Raising bridge for " + msg_sfx + attach_cmd,
-                          logging.debug)
             # assume this will puke if netdst unset
-            if not nic.netdst is None:
+            if not nic.netdst is None and nic.nettype == "bridge":
+                error.context("Raising bridge for " + msg_sfx + attach_cmd,
+                              logging.debug)
                 utils_net.add_to_bridge(nic.ifname, nic.netdst)
-        elif nic.nettype == 'macvtap':
-            pass
         elif nic.nettype == 'user':
             attach_cmd += " user,id=%s" % nic.device_id
         elif nic.nettype == 'none':
@@ -2692,7 +2868,7 @@ class VM(virt_vm.BaseVM):
         else:  # unsupported nettype
             raise virt_vm.VMUnknownNetTypeError(self.name, nic_index_or_name,
                                                 nic.nettype)
-        if nic.has_key('netdev_extra_params'):
+        if nic.has_key('netdev_extra_params') and nic.netdev_extra_params:
             attach_cmd += nic.netdev_extra_params
         error.context("Hotplugging " + msg_sfx + attach_cmd, logging.debug)
 
@@ -2769,7 +2945,9 @@ class VM(virt_vm.BaseVM):
 
         if wait:
             logging.info("waiting for the guest to finish the unplug")
-            if not utils_misc.wait_for(lambda: nic.nic_name not in
+            nic_eigenvalue = r'dev:\s+%s,\s+id\s+"%s"' % (nic.nic_model,
+                                                          nic.nic_name)
+            if not utils_misc.wait_for(lambda: nic_eigenvalue not in
                                        self.monitor.info("qtree"),
                                        wait, 5, 1):
                 raise virt_vm.VMDelNicError("Device is not unplugged by "
@@ -2785,7 +2963,8 @@ class VM(virt_vm.BaseVM):
         :param: nic_index_or_name: name or index number for existing NIC
         """
         # FIXME: Need to down interface & remove from bridge????
-        netdev_id = self.virtnet[nic_index_or_name].device_id
+        nic = self.virtnet[nic_index_or_name]
+        netdev_id = nic.device_id
         error.context("removing netdev id %s from vm %s" %
                       (netdev_id, self.name))
         nic_del_cmd = "netdev_del id=%s" % netdev_id
@@ -2796,9 +2975,13 @@ class VM(virt_vm.BaseVM):
             self.monitor.send_args_cmd(nic_del_cmd, convert=True)
 
         network_info = self.monitor.info("network")
-        if netdev_id in network_info:
+        netdev_eigenvalue = r'netdev\s+=\s+%s' % netdev_id
+        if netdev_eigenvalue in network_info:
             raise virt_vm.VMDelNetDevError("Fail to remove netdev %s" %
                                            netdev_id)
+        if nic.nettype == 'macvtap':
+            tap = utils_net.Macvtap(nic.ifname)
+            tap.delete()
 
     @error.context_aware
     def del_nic(self, nic_index_or_name):
@@ -2882,7 +3065,7 @@ class VM(virt_vm.BaseVM):
                 clean=True, save_path="/tmp", dest_host="localhost",
                 remote_port=None, not_wait_for_migration=False,
                 fd_src=None, fd_dst=None, migration_exec_cmd_src=None,
-                migration_exec_cmd_dst=None):
+                migration_exec_cmd_dst=None, env=None):
         """
         Migrate the VM.
 
@@ -2900,7 +3083,7 @@ class VM(virt_vm.BaseVM):
                 differ.
         :param clean: If True, delete the saved state files (relevant only if
                 stable_check is also True).
-        @save_path: The path for state files.
+        :param save_path: The path for state files.
         :param dest_host: Destination host (defaults to 'localhost').
         :param remote_port: Port to use for remote migration.
         :param not_wait_for_migration: If True migration start but not wait till
@@ -2915,6 +3098,7 @@ class VM(virt_vm.BaseVM):
         :param migration_exec_cmd_dst: Command to embed in '-incoming "exec: "'
                 (e.g. 'gzip -c -d filename') if migration_mode is 'exec'
                 default to listening on a random TCP port
+        :param env: Dictionary with test environment
         """
         if protocol not in self.MIGRATION_PROTOS:
             raise virt_vm.VMMigrateProtoUnknownError(protocol)
@@ -2934,6 +3118,8 @@ class VM(virt_vm.BaseVM):
             os.close(fd_src)
 
         clone = self.clone()
+        if env:
+            env.register_vm("%s_clone" % clone.name, clone)
         if (local and not (migration_exec_cmd_src
                            and "gzip" in migration_exec_cmd_src)):
             error.context("creating destination VM")
@@ -3091,6 +3277,8 @@ class VM(virt_vm.BaseVM):
                 if self.is_alive():
                     self.monitor.cmd("cont")
                 clone.destroy(gracefully=False)
+                if env:
+                    env.unregister_vm("%s_clone" % self.name)
 
     @error.context_aware
     def reboot(self, session=None, method="shell", nic_index=0,
@@ -3484,3 +3672,21 @@ class VM(virt_vm.BaseVM):
         :param device: device ID
         """
         return self.monitor.query_block_job(device)
+
+    def eject_cdrom(self, device, force=False):
+        """
+        Eject cdrom and open door of the CDROM;
+
+        :param device: device ID;
+        :param force: force eject or not;
+        """
+        return self.monitor.eject_cdrom(device, force)
+
+    def change_media(self, device, target):
+        """
+        Change media of cdrom;
+
+        :param device: Device ID;
+        :param target: new media file;
+        """
+        return self.monitor.change_media(device, target)

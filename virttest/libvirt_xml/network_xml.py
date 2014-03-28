@@ -4,7 +4,7 @@ http://libvirt.org/formatnetwork.html
 """
 
 import logging
-from virttest import virsh, xml_utils
+from virttest import xml_utils
 from virttest.libvirt_xml import base, xcepts, accessors
 
 
@@ -220,7 +220,8 @@ class NetworkXMLBase(base.LibvirtXMLBase):
         """
         Accessor for 'define' property - does this name exist in network list
         """
-        return self.name in self.virsh.net_state_dict(only_names=True).keys()
+        params = {'only_names': True, 'virsh_instance': self.virsh}
+        return self.name in self.virsh.net_state_dict(**params)
 
     def set_defined(self, value):
         """Accessor method for 'define' property, set True to define."""
@@ -241,7 +242,7 @@ class NetworkXMLBase(base.LibvirtXMLBase):
         """Accessor method for 'active' property (True/False)"""
         self.__check_undefined__("Cannot determine activation for undefined "
                                  "network")
-        state_dict = self.virsh.net_state_dict()
+        state_dict = self.virsh.net_state_dict(virsh_instance=self.virsh)
         return state_dict[self.name]['active']
 
     def set_active(self, value):
@@ -273,7 +274,7 @@ class NetworkXMLBase(base.LibvirtXMLBase):
         """Accessor method for 'autostart' property, True if set"""
         self.__check_undefined__("Cannot determine autostart for undefined "
                                  "network")
-        state_dict = self.virsh.net_state_dict()
+        state_dict = self.virsh.net_state_dict(virsh_instance=self.virsh)
         return state_dict[self.name]['autostart']
 
     def set_autostart(self, value):
@@ -301,7 +302,7 @@ class NetworkXMLBase(base.LibvirtXMLBase):
 
     def get_persistent(self):
         """Accessor method for 'persistent' property"""
-        state_dict = self.virsh.net_state_dict()
+        state_dict = self.virsh.net_state_dict(virsh_instance=self.virsh)
         return state_dict[self.name]['persistent']
 
     # Copy behavior for consistency
@@ -387,10 +388,11 @@ class NetworkXML(NetworkXMLBase):
         result = {}
         # Values should all share virsh property
         new_netxml = NetworkXML(virsh_instance=virsh_instance)
-        networks = new_netxml.virsh.net_state_dict(only_names=True).keys()
+        params = {'only_names': True, 'virsh_instance': virsh_instance}
+        networks = new_netxml.virsh.net_state_dict(**params).keys()
         for net_name in networks:
             new_copy = new_netxml.copy()
-            new_copy.xml = virsh.net_dumpxml(net_name).stdout.strip()
+            new_copy.xml = virsh_instance.net_dumpxml(net_name).stdout.strip()
             result[net_name] = new_copy
         return result
 
@@ -426,6 +428,16 @@ class NetworkXML(NetworkXMLBase):
         xml = str(self)  # LibvirtXMLBase.__str__ returns XML content
         for debug_line in str(xml).splitlines():
             logging.debug("Network XML: %s", debug_line)
+
+    def state_dict(self):
+        """
+        Return a dict containing states of active/autostart/persistent
+
+        :return: A dict contains active/autostart/persistent as keys
+                 and boolean as values or None if network doesn't exist.
+        """
+        if self.defined:
+            return self.virsh.net_state_dict(virsh_instance=self.virsh)[self.name]
 
     def create(self):
         """
@@ -484,11 +496,27 @@ class NetworkXML(NetworkXMLBase):
                                          "Detail: %s" %
                                          (self.name, cmd_result.stderr))
 
-    def sync(self):
+    def sync(self, state=None):
         """
         Make the change of "self" take effect on network.
+        Recover network to designated state if option state is set.
+
+        :param state: a boolean dict contains active/persistent/autostart as
+                      keys
         """
-        if self.exists():
-            self.undefine()
-        self.define()
-        self.start()
+        if self['defined']:
+            if self['active']:
+                del self['active']
+            if self['defined']:
+                del self['defined']
+
+        self['defined'] = True
+        if state:
+            self['active'] = state['active']
+            if not state['persistent']:
+                del self['persistent']
+            if self.defined:
+                self['autostart'] = state['autostart']
+        else:
+            self['active'] = True
+            self['autostart'] = True

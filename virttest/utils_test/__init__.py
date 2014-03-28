@@ -32,11 +32,13 @@ import time
 from autotest.client import utils, os_dep
 from autotest.client.shared import error
 from autotest.client.tools import scan_results
-from virttest import aexpect, remote, utils_misc, virt_vm, data_dir
+from virttest import aexpect, remote, utils_misc, virt_vm, data_dir, utils_net
+from virttest import storage, asset, bootstrap
 import virttest
 
 import libvirt
 import qemu
+import libguestfs
 
 try:
     from virttest.staging import utils_cgroup
@@ -191,16 +193,36 @@ def get_time(session, time_command, time_filter_re, time_format):
     :return: A tuple containing the host time and guest time.
     """
     if re.findall("ntpdate|w32tm", time_command):
-        o = session.cmd(time_command)
+        output = session.cmd(time_command)
         if re.match('ntpdate', time_command):
-            offset = re.findall('offset (.*) sec', o)[0]
-            host_main, host_mantissa = re.findall(time_filter_re, o)[0]
-            host_time = (time.mktime(time.strptime(host_main, time_format)) +
-                         float("0.%s" % host_mantissa))
+            try:
+                offset = re.findall('offset (.*) sec', output)[0]
+            except IndexError:
+                msg = "Fail to get guest time offset. Command "
+                msg += "'%s', output: %s" % (time_command, output)
+                raise error.TestError(msg)
+            try:
+                host_main, host_mantissa = re.findall(time_filter_re, output)[0]
+                host_time = (time.mktime(time.strptime(host_main, time_format)) +
+                             float("0.%s" % host_mantissa))
+            except Exception:
+                msg = "Fail to get host time. Command '%s', " % time_command
+                msg += "output: %s" % output
+                raise error.TestError(msg)
             guest_time = host_time - float(offset)
         else:
-            guest_time = re.findall(time_filter_re, o)[0]
-            offset = re.findall("o:(.*)s", o)[0]
+            try:
+                guest_time = re.findall(time_filter_re, output)[0]
+            except IndexError:
+                msg = "Fail to get guest time. Command '%s', " % time_command
+                msg += "output: %s" % output
+                raise error.TestError(msg)
+            try:
+                offset = re.findall("o:(.*)s", output)[0]
+            except IndexError:
+                msg = "Fail to get guest time offset. Command "
+                msg += "'%s', output: %s" % (time_command, output)
+                raise error.TestError(msg)
             if re.match('PM', guest_time):
                 hour = re.findall('\d+ (\d+):', guest_time)[0]
                 hour = str(int(hour) + 12)
@@ -220,60 +242,60 @@ def get_time(session, time_command, time_filter_re, time_format):
                 locale.setlocale(locale.LC_TIME, "C")
                 host_time = time.mktime(time.strptime(host_time_out, time_format))
                 host_time += float(diff.split(" ")[0])
-            except Exception, e:
+            except Exception, err:
                 logging.debug("(time_format, time_string): (%s, %s)",
                               time_format, host_time_out)
-                raise e
+                raise err
         finally:
             locale.setlocale(locale.LC_TIME, loc)
 
-        s = session.cmd_output(time_command)
+        output = session.cmd_output(time_command)
 
         # Get and parse guest time
         try:
-            s = re.findall(time_filter_re, s)[0]
-            s, diff = s.split("  ")
+            str_time = re.findall(time_filter_re, output)[0]
+            str_time, diff = str_time.split("  ")
         except IndexError:
-            logging.debug("The time string from guest is:\n%s", s)
+            logging.debug("The time string from guest is:\n%s", str_time)
             raise error.TestError("The time string from guest is unexpected.")
-        except Exception, e:
+        except Exception, err:
             logging.debug("(time_filter_re, time_string): (%s, %s)",
-                          time_filter_re, s)
-            raise e
+                          time_filter_re, str_time)
+            raise err
 
         guest_time = None
         try:
             try:
                 locale.setlocale(locale.LC_TIME, "C")
-                guest_time = time.mktime(time.strptime(s, time_format))
+                guest_time = time.mktime(time.strptime(str_time, time_format))
                 guest_time += float(diff.split(" ")[0])
-            except Exception, e:
+            except Exception, err:
                 logging.debug("(time_format, time_string): (%s, %s)",
                               time_format, host_time_out)
-                raise e
+                raise err
         finally:
             locale.setlocale(locale.LC_TIME, loc)
     else:
         host_time = time.time()
-        s = session.cmd_output(time_command).strip()
-        n = 0.0
+        output = session.cmd_output(time_command).strip()
+        num = 0.0
         reo = None
 
         try:
-            reo = re.findall(time_filter_re, s)[0]
+            reo = re.findall(time_filter_re, output)[0]
             if len(reo) > 1:
-                n = float(reo[1])
+                num = float(reo[1])
         except IndexError:
-            logging.debug("The time string from guest is:\n%s", s)
+            logging.debug("The time string from guest is:\n%s", output)
             raise error.TestError("The time string from guest is unexpected.")
-        except ValueError, e:
+        except ValueError, err:
             logging.debug("Couldn't create float number from %s" % (reo[1]))
-        except Exception, e:
+        except Exception, err:
             logging.debug("(time_filter_re, time_string): (%s, %s)",
-                          time_filter_re, s)
-            raise e
+                          time_filter_re, output)
+            raise err
 
-        guest_time = time.mktime(time.strptime(reo, time_format)) + n
+        guest_time = time.mktime(time.strptime(reo, time_format)) + num
 
     return (host_time, guest_time)
 
@@ -330,7 +352,7 @@ def run_image_copy(test, params, env):
     src = params.get('images_good')
     asset_name = '%s' % (os.path.split(params['image_name'])[1])
     image = '%s.%s' % (params['image_name'], params['image_format'])
-    dst_path = '%s/%s' % (virttest.data_dir.get_data_dir(), image)
+    dst_path = storage.get_image_filename(params, data_dir.get_data_dir())
     image_dir = os.path.dirname(dst_path)
     if params.get("rename_error_image", "no") == "yes":
         error_image = os.path.basename(params['image_name']) + "-error"
@@ -480,7 +502,7 @@ def run_file_transfer(test, params, env):
 
 
 def run_autotest(vm, session, control_path, timeout,
-                 outputdir, params, copy_only=False):
+                 outputdir, params, copy_only=False, control_args=None):
     """
     Run an autotest control file inside a guest (linux only utility).
 
@@ -493,6 +515,7 @@ def run_autotest(vm, session, control_path, timeout,
     :param copy_only: If copy_only is True, copy the autotest to guest and
             return the command which need to run test on guest, without
             executing it.
+    :param control_args: The arguments for control file.
 
     The following params is used by the migration
     :param params: Test params used in the migration test
@@ -555,17 +578,21 @@ def run_autotest(vm, session, control_path, timeout,
             session.cmd("mv %s %s" %
                         (autotest_dirname, os.path.basename(dest_dir)))
 
+    def get_last_guest_results_index():
+        res_index = 0
+        for subpath in os.listdir(outputdir):
+            if re.search("guest_autotest_results\d+", subpath):
+                res_index = max(res_index, int(re.search("guest_autotest_results(\d+)", subpath).group(1)))
+        return res_index
+
     def get_results(base_results_dir):
         """
         Copy autotest results present on the guest back to the host.
         """
         logging.debug("Trying to copy autotest results from guest")
-        guest_results_dir = os.path.join(outputdir, "guest_autotest_results")
-        try:
-            os.mkdir(guest_results_dir)
-        except OSError, detail:
-            if detail.errno != errno.EEXIST:
-                raise
+        res_index = get_last_guest_results_index()
+        guest_results_dir = os.path.join(outputdir, "guest_autotest_results%s" % (res_index+1))
+        os.mkdir(guest_results_dir)
         # result info tarball to host result dir
         session = vm.wait_for_login(timeout=360)
         results_dir = "%s/results/default" % base_results_dir
@@ -594,7 +621,8 @@ def run_autotest(vm, session, control_path, timeout,
         NOTE: This function depends on the results copied to host by
               get_results() function, so call get_results() first.
         """
-        base_dir = os.path.join(outputdir, "guest_autotest_results")
+        res_index = get_last_guest_results_index()
+        base_dir = os.path.join(outputdir, "guest_autotest_results%s" % res_index)
         status_paths = glob.glob(os.path.join(base_dir, "*/status"))
         # for control files that do not use job.run_test()
         status_no_job = os.path.join(base_dir, "status")
@@ -619,9 +647,33 @@ def run_autotest(vm, session, control_path, timeout,
             logging.error("Error processing guest autotest results: %s", e)
             return None
 
-    if not os.path.isfile(control_path):
-        raise error.TestError("Invalid path to autotest control file: %s" %
-                              control_path)
+    def config_control(control_path):
+        """
+        Edit the control file to adapt the current environment.
+
+        Replace CLIENTIP with guestip, and replace SERVERIP with hostip.
+
+        :return: Path of a temp file which contains the result of replacing.
+        """
+        pattern2repl_dict = {r'CLIENTIP': vm.get_address(),
+                             r'SERVERIP': utils_net.get_host_ip_address(params)}
+        control_file = open(control_path)
+        lines = control_file.readlines()
+        control_file.close()
+
+        for pattern, repl in pattern2repl_dict.items():
+            for index in range(len(lines)):
+                line = lines[index]
+                lines[index] = re.sub(pattern, repl, line)
+
+        fd, temp_control_path = tempfile.mkstemp(prefix="control",
+                                                 dir=data_dir.get_tmp_dir())
+        os.close(fd)
+
+        temp_control = open(temp_control_path, "w")
+        temp_control.writelines(lines)
+        temp_control.close()
+        return temp_control_path
 
     migrate_background = params.get("migrate_background") == "yes"
     if migrate_background:
@@ -683,17 +735,30 @@ def run_autotest(vm, session, control_path, timeout,
     vm.copy_files_to(g_path, global_config_guest)
     os.unlink(g_path)
 
-    vm.copy_files_to(control_path,
-                     os.path.join(destination_autotest_path, 'control'))
-
     if not single_dir_install:
         vm.copy_files_to(autotest_local_path,
                          os.path.join(destination_autotest_path,
                                       'autotest-local'))
+
+    # Support autotests that are in client-server model.
+    server_control_path = None
+    if os.path.isdir(control_path):
+        server_control_path = os.path.join(control_path, "control.server")
+        server_control_path = config_control(server_control_path)
+        control_path = os.path.join(control_path, "control.client")
+    # Edit control file and copy it to vm.
+    temp_control_path = config_control(control_path)
+    vm.copy_files_to(temp_control_path,
+                     os.path.join(destination_autotest_path, 'control'))
+
+    # remove the temp control file.
+    if os.path.exists(temp_control_path):
+        os.remove(temp_control_path)
+
     if not kernel_install_present:
         kernel_install_dir = os.path.join(virttest.data_dir.get_root_dir(),
-                                          "shared", "deps",
-                                          "test_kernel_install")
+                                          "shared", "deps", "run_autotest",
+                                          "kernel_install")
         kernel_install_dest = os.path.join(destination_autotest_path, 'tests',
                                            'kernelinstall')
         vm.copy_files_to(kernel_install_dir, kernel_install_dest)
@@ -703,7 +768,8 @@ def run_autotest(vm, session, control_path, timeout,
 
     # Copy a non crippled boottool and make it executable
     boottool_path = os.path.join(virttest.data_dir.get_root_dir(),
-                                 "shared", "deps", "boottool.py")
+                                 "shared", "deps", "run_autotest",
+                                 "boottool.py")
     boottool_dest = '/usr/local/autotest/tools/boottool.py'
     vm.copy_files_to(boottool_path, boottool_dest)
     session.cmd("chmod +x %s" % boottool_dest)
@@ -719,12 +785,22 @@ def run_autotest(vm, session, control_path, timeout,
 
     # Check copy_only.
     if copy_only:
-        return ("%s/autotest-local --verbose %s/control" %
-                (destination_autotest_path, destination_autotest_path))
+        return ("%s/autotest-local --args=\"%s\" --verbose %s/control" %
+                (destination_autotest_path, control_args,
+                 destination_autotest_path))
 
     # Run the test
     logging.info("Running autotest control file %s on guest, timeout %ss",
                  os.path.basename(control_path), timeout)
+
+    # Start a background job to run server process if needed.
+    server_process = None
+    if server_control_path:
+        command = ("%s %s --verbose -t %s" % (autotest_local_path,
+                                              server_control_path,
+                                              os.path.basename(server_control_path)))
+        server_process = aexpect.run_bg(command)
+
     try:
         bg = None
         try:
@@ -735,7 +811,9 @@ def run_autotest(vm, session, control_path, timeout,
 
                 bg = utils.InterruptedThread(session.cmd_output,
                                              kwargs={
-                                                 'cmd': "./autotest control",
+                                                 'cmd': "./autotest --args="
+                                                        "\"%s\" control" %
+                                                        (control_args),
                                                  'timeout': timeout,
                                                  'print_func': logging.info})
 
@@ -746,13 +824,35 @@ def run_autotest(vm, session, control_path, timeout,
                                  "migration")
                     vm.migrate(timeout=mig_timeout, protocol=mig_protocol)
             else:
-                session.cmd_output("./autotest-local --verbose control",
+                if params.get("guest_autotest_verbosity", "yes") == "yes":
+                    verbose = " --verbose"
+                else:
+                    verbose = ""
+                session.cmd_output("./autotest-local --args=\"%s\"%s"
+                                   " control" % (control_args, verbose),
                                    timeout=timeout,
                                    print_func=logging.info)
         finally:
             logging.info("------------- End of test output ------------")
             if migrate_background and bg:
                 bg.join()
+            # Do some cleanup work on host if test need a server.
+            if server_process:
+                if server_process.is_alive():
+                    utils_misc.kill_process_tree(server_process.get_pid(),
+                                                 signal.SIGINT)
+                server_process.close()
+
+                # Remove the result dir produced by server_process.
+                server_result = os.path.join(autotest_path,
+                                             "results",
+                                             os.path.basename(server_control_path))
+                if os.path.isdir(server_result):
+                    utils.safe_rmdir()
+                # Remove the control file for server.
+                if os.path.exists(server_control_path):
+                    os.remove(server_control_path)
+
     except aexpect.ShellTimeoutError:
         if vm.is_alive():
             get_results(destination_autotest_path)
@@ -878,16 +978,23 @@ def ping(dest=None, count=None, interval=None, interface=None,
     :param output_func: Function used to log the result of ping.
     :param session: Local executon hint or session to execute the ping command.
     """
+    command = "ping"
+    if ":" in dest:
+        command = "ping6"
     if dest is not None:
-        command = "ping %s " % dest
+        command += " %s " % dest
     else:
-        command = "ping localhost "
+        command += " localhost "
     if count is not None:
         command += " -c %s" % count
     if interval is not None:
         command += " -i %s" % interval
     if interface is not None:
         command += " -I %s" % interface
+    else:
+        if dest.upper().startswith("FE80"):
+            err_msg = "Using ipv6 linklocal must assigne interface"
+            raise error.TestNAError(err_msg)
     if packetsize is not None:
         command += " -s %s" % packetsize
     if ttl is not None:
@@ -917,31 +1024,43 @@ def run_virt_sub_test(test, params, env, sub_type=None, tag=None):
     :param tag:    Tag for get the sub_test params
     """
     if sub_type is None:
-        raise error.TestError("No sub test is found")
-    virt_dir = os.path.dirname(test.virtdir)
-    subtest_dir_virt = os.path.join(virt_dir, "tests")
-    subtest_dir_specific = os.path.join(test.bindir, params.get('vm_type'),
-                                        "tests")
-    subtest_dir = None
-    subtest_dirs = data_dir.SubdirList(subtest_dir_virt)
-    subtest_dirs += data_dir.SubdirList(subtest_dir_specific)
+        raise error.TestError("Unspecified sub test type. Please specify a"
+                              "sub test type")
+
+    provider = params.get("provider", None)
+    subtest_dirs = []
+
+    if provider is None:
+        # Verify if we have the correspondent source file for it
+        for generic_subdir in asset.get_test_provider_subdirs('generic'):
+            subtest_dirs += data_dir.SubdirList(generic_subdir,
+                                                bootstrap.test_filter)
+
+        for specific_subdir in asset.get_test_provider_subdirs(params.get("vm_type")):
+            subtest_dirs += data_dir.SubdirList(specific_subdir,
+                                                bootstrap.test_filter)
+    else:
+        provider_info = asset.get_test_provider_info(provider)
+        for key in provider_info['backends']:
+            subtest_dirs += data_dir.SubdirList(
+                provider_info['backends'][key]['path'],
+                bootstrap.test_filter)
+
     for d in subtest_dirs:
         module_path = os.path.join(d, "%s.py" % sub_type)
         if os.path.isfile(module_path):
             subtest_dir = d
             break
+
     if subtest_dir is None:
         raise error.TestError("Could not find test file %s.py "
-                              "on either %s or %s "
-                              "directory" % (sub_type,
-                                             subtest_dir_specific,
-                                             subtest_dir_virt))
+                              "on directories %s" % (sub_type, subtest_dirs))
 
     f, p, d = imp.find_module(sub_type, [subtest_dir])
     test_module = imp.load_module(sub_type, f, p, d)
     f.close()
     # Run the test function
-    run_func = getattr(test_module, "run_%s" % sub_type)
+    run_func = utils_misc.get_test_entrypoint_func(sub_type, test_module)
     if tag is not None:
         params = params.object_params(tag)
     run_func(test, params, env)
@@ -1119,13 +1238,13 @@ class BackgroundTest(object):
         """
         self.thread.start()
 
-    def join(self, timeout=600):
+    def join(self, timeout=600, ignore_status=False):
         """
         Wait for the join of thread and raise its exception if any.
         """
         self.thread.join(timeout)
         # pylint: disable=E0702
-        if self.exception:
+        if self.exception and (not ignore_status):
             raise self.exception
 
     def is_alive(self):
@@ -1177,3 +1296,32 @@ def get_image_info(image_file):
     except (KeyError, IndexError, ValueError, error.CmdError), detail:
         raise error.TestError("Fail to get information of %s:\n%s" %
                               (image_file, detail))
+
+
+def ntpdate(service_ip, session=None):
+    """
+    set the date and time via NTP
+    """
+    try:
+        ntpdate_cmd = "ntpdate %s" % service_ip
+        if session:
+            session.cmd(ntpdate_cmd)
+        else:
+            utils.run(ntpdate_cmd)
+    except (error.CmdError, aexpect.ShellError), detail:
+        raise error.TestFail("Failed to set the date and time. %s" % detail)
+
+
+def get_date(session=None):
+    """
+    Get the date time
+    """
+    try:
+        date_cmd = "date +%s"
+        if session:
+            date_info = session.cmd_output(date_cmd).strip()
+        else:
+            date_info = utils.run(date_cmd).stdout.strip()
+        return date_info
+    except (error.CmdError, aexpect.ShellError), detail:
+        raise error.TestFail("Get date failed. %s " % detail)

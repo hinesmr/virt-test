@@ -7,6 +7,7 @@ import glob
 import threading
 import shutil
 import sys
+import copy
 from autotest.client import utils
 from autotest.client.shared import error
 import aexpect
@@ -38,6 +39,9 @@ except ImportError:
 _screendump_thread = None
 _screendump_thread_termination_event = None
 
+_vm_register_thread = None
+_vm_register_thread_termination_event = None
+
 
 def preprocess_image(test, params, image_name):
     """
@@ -49,15 +53,17 @@ def preprocess_image(test, params, image_name):
     """
     base_dir = params.get("images_base_dir", data_dir.get_data_dir())
 
+    if not storage.preprocess_image_backend(base_dir, params, image_name):
+        logging.error("Backend can't be prepared correctly.")
+
     image_filename = storage.get_image_filename(params,
                                                 base_dir)
 
     create_image = False
-
     if params.get("force_create_image") == "yes":
         create_image = True
     elif (params.get("create_image") == "yes" and not
-          os.path.exists(image_filename)):
+          storage.file_exists(params, image_filename)):
         create_image = True
 
     if params.get("backup_image_before_testing", "no") == "yes":
@@ -83,6 +89,7 @@ def preprocess_vm(test, params, env, name):
     target = params.get('target')
     if not vm:
         vm = env.create_vm(vm_type, target, name, params, test.bindir)
+    old_vm = copy.copy(vm)
 
     remove_vm = False
     if params.get("force_remove_vm") == "yes":
@@ -92,12 +99,10 @@ def preprocess_vm(test, params, env, name):
         vm.remove()
 
     start_vm = False
+    update_virtnet = False
+    gracefully_kill = params.get("kill_vm_gracefully") == "yes"
 
-    if params.get("restart_vm") == "yes":
-        if vm.is_alive():
-            vm.destroy(gracefully=True, free_mac_addresses=False)
-        start_vm = True
-    elif params.get("migration_mode"):
+    if params.get("migration_mode"):
         start_vm = True
     elif params.get("start_vm") == "yes":
         # need to deal with libvirt VM differently than qemu
@@ -111,7 +116,10 @@ def preprocess_vm(test, params, env, name):
                 if vm.needs_restart(name=name,
                                     params=params,
                                     basedir=test.bindir):
+                    vm.devices = None
                     start_vm = True
+                    old_vm.destroy(gracefully=gracefully_kill)
+                    update_virtnet = True
 
     if start_vm:
         if vm_type == "libvirt" and params.get("type") != "unattended_install":
@@ -121,6 +129,9 @@ def preprocess_vm(test, params, env, name):
             vm.params = params
             vm.start()
         else:
+            if update_virtnet:
+                vm.update_vm_id()
+                vm.virtnet = utils_net.VirtNet(params, name, vm.instance)
             # Start the VM (or restart it if it's already up)
             if params.get("reuse_previous_config", "no") == "no":
                 vm.create(name, params, test.bindir,
@@ -131,18 +142,16 @@ def preprocess_vm(test, params, env, name):
                 vm.create(migration_mode=params.get("migration_mode"),
                           migration_fd=params.get("migration_fd"),
                           migration_exec_cmd=params.get("migration_exec_cmd_dst"))
-            # Update mac and IP info for assigned device
-            # NeedFix: Can we find another way to get guest ip?
-            if params.get("mac_changeable") == "yes":
-                utils_net.update_mac_ip_address(vm, params)
     elif not vm.is_alive():    # VM is dead and won't be started, update params
         vm.devices = None
         vm.params = params
     else:       # VM is alive and we don't care
         if params.get("kill_vm_before_test") == "yes":
             # Destroy the VM if kill_vm_before_test = "yes".
-            vm.destroy(gracefully=params.get("kill_vm_gracefully") == "yes",
-                       free_mac_addresses=False)
+            old_vm.destroy(gracefully=gracefully_kill)
+        else:
+            # VM is alive and we just need to open the serial console
+            vm.create_serial_console()
 
     pause_vm = False
 
@@ -173,7 +182,13 @@ def postprocess_image(test, params, image_name):
             elif clone_master == "yes":
                 if image_name in params.get("master_images_clone").split():
                     image.check_image(params, base_dir)
-            if params.get("restore_image", "no") == "yes":
+            # Allow test to overwrite any pre-testing  automatic backup
+            # with a new backup. i.e. assume pre-existing image/backup
+            # would not be usable after this test succeeds. The best
+            # example for this is when 'unattended_install' is run.
+            if params.get("backup_image", "no") == "yes":
+                image.backup_image(params, base_dir, "backup", True)
+            elif params.get("restore_image", "no") == "yes":
                 image.backup_image(params, base_dir, "restore", True)
         except Exception, e:
             if params.get("restore_image_on_check_error", "no") == "yes":
@@ -208,31 +223,12 @@ def postprocess_vm(test, params, env, name):
         return
 
     # Close all SSH sessions that might be active to this VM
-    for s in vm.remote_sessions:
+    for s in [x for x in vm.remote_sessions]:
         try:
             s.close()
             vm.remote_sessions.remove(s)
         except Exception:
             pass
-
-    # Encode an HTML 5 compatible video from the screenshots produced
-    screendump_dir = os.path.join(test.debugdir, "screendumps_%s" % vm.name)
-    if (params.get("encode_video_files", "yes") == "yes" and
-            glob.glob("%s/*" % screendump_dir)):
-        try:
-            video = video_maker.GstPythonVideoMaker()
-            if (video.has_element('vp8enc') and video.has_element('webmmux')):
-                video_file = os.path.join(test.debugdir, "%s-%s.webm" %
-                                          (vm.name, test.iteration))
-            else:
-                video_file = os.path.join(test.debugdir, "%s-%s.ogg" %
-                                          (vm.name, test.iteration))
-            logging.debug("Encoding video file %s", video_file)
-            video.start(screendump_dir, video_file)
-
-        except Exception, detail:
-            logging.info(
-                "Video creation failed for vm %s: %s", vm.name, detail)
 
     if params.get("kill_vm") == "yes":
         kill_vm_timeout = float(params.get("kill_vm_timeout", 0))
@@ -443,6 +439,12 @@ def preprocess(test, params, env):
         params["image_name"] = iscsidev.setup()
         params["image_raw_device"] = "yes"
 
+    if params.get("storage_type") == "lvm":
+        lvmdev = qemu_storage.LVMdev(params, base_dir, "lvm")
+        params["image_name"] = lvmdev.setup()
+        params["image_raw_device"] = "yes"
+        env.register_lvmdev("lvm_%s" % params["main_vm"], lvmdev)
+
     if params.get("storage_type") == "nfs":
         image_nfs = nfs.Nfs(params)
         image_nfs.setup()
@@ -457,35 +459,9 @@ def preprocess(test, params, env):
                                                 image_name_only)
 
     # Start tcpdump if it isn't already running
-    if "address_cache" not in env:
-        env["address_cache"] = {}
-    if "tcpdump" in env and not env["tcpdump"].is_alive():
-        env["tcpdump"].close()
-        del env["tcpdump"]
-    if "tcpdump" not in env and params.get("run_tcpdump", "yes") == "yes":
-        cmd = "%s -npvi any 'port 68'" % utils_misc.find_command("tcpdump")
-        if params.get("remote_preprocess") == "yes":
-            login_cmd = ("ssh -o UserKnownHostsFile=/dev/null -o \
-                         PreferredAuthentications=password -p %s %s@%s" %
-                         (port, username, address))
-            env["tcpdump"] = aexpect.ShellSession(
-                login_cmd,
-                output_func=_update_address_cache,
-                output_params=(env["address_cache"],))
-            remote.handle_prompts(env["tcpdump"], username, password, prompt)
-            env["tcpdump"].sendline(cmd)
-        else:
-            env["tcpdump"] = aexpect.Tail(
-                command=cmd,
-                output_func=_tcpdump_handler,
-                output_params=(env["address_cache"], "tcpdump.log",))
-
-        if utils_misc.wait_for(lambda: not env["tcpdump"].is_alive(),
-                               0.1, 0.1, 1.0):
-            logging.warn("Could not start tcpdump")
-            logging.warn("Status: %s" % env["tcpdump"].get_status())
-            logging.warn("Output:" + utils_misc.format_str_for_message(
-                env["tcpdump"].get_output()))
+    # The fact it has to be started here is so that the test params
+    # have to be honored.
+    env.start_tcpdump(params)
 
     # Destroy and remove VMs that are no longer needed in the environment
     requested_vms = params.objects("vms")
@@ -644,7 +620,7 @@ def preprocess(test, params, env):
         for vm_name in params.get("vms").split():
             vm = env.get_vm(vm_name)
             if vm:
-                vm.destroy(free_mac_addresses=False)
+                vm.destroy()
                 env.unregister_vm(vm_name)
 
             vm_params = params.object_params(vm_name)
@@ -664,6 +640,15 @@ def preprocess(test, params, env):
                                               name='ScreenDump',
                                               args=(test, params, env))
         _screendump_thread.start()
+
+    # Start the register query thread
+    if params.get("store_vm_register") == "yes":
+        global _vm_register_thread, _vm_register_thread_termination_event
+        _vm_register_thread_termination_event = threading.Event()
+        _vm_register_thread = threading.Thread(target=_store_vm_register,
+                                               name='VmRegister',
+                                               args=(test, params, env))
+        _vm_register_thread.start()
 
     return params
 
@@ -695,13 +680,35 @@ def postprocess(test, params, env):
         _screendump_thread.join(10)
         _screendump_thread = None
 
+    # Encode an HTML 5 compatible video from the screenshots produced
+
+    dirs = re.findall("(screendump\S*_[0-9]+)", str(os.listdir(test.debugdir)))
+    for dir in dirs:
+        screendump_dir = os.path.join(test.debugdir, dir)
+        if (params.get("encode_video_files", "yes") == "yes" and
+           glob.glob("%s/*" % screendump_dir)):
+            try:
+                video = video_maker.GstPythonVideoMaker()
+                if (video.has_element('vp8enc') and video.has_element('webmmux')):
+                    video_file = os.path.join(test.debugdir, "%s-%s.webm" %
+                                             (screendump_dir, test.iteration))
+                else:
+                    video_file = os.path.join(test.debugdir, "%s-%s.ogg" %
+                                             (screendump_dir, test.iteration))
+                logging.debug("Encoding video file %s", video_file)
+                video.start(screendump_dir, video_file)
+
+            except Exception, detail:
+                logging.info(
+                    "Video creation failed for %s: %s", screendump_dir, detail)
+
     # Warn about corrupt PPM files
     for f in glob.glob(os.path.join(test.debugdir, "*.ppm")):
         if not ppm_utils.image_verify_ppm_file(f):
             logging.warn("Found corrupt PPM file: %s", f)
 
     # Should we convert PPM files to PNG format?
-    if params.get("convert_ppm_files_to_png") == "yes":
+    if params.get("convert_ppm_files_to_png", "no") == "yes":
         try:
             for f in glob.glob(os.path.join(test.debugdir, "*.ppm")):
                 if ppm_utils.image_verify_ppm_file(f):
@@ -727,6 +734,13 @@ def postprocess(test, params, env):
         for f in (glob.glob(os.path.join(test.debugdir, '*.ogg')) +
                   glob.glob(os.path.join(test.debugdir, '*.webm'))):
             os.unlink(f)
+
+    # Terminate the register query thread
+    global _vm_register_thread, _vm_register_thread_termination_event
+    if _vm_register_thread is not None:
+        _vm_register_thread_termination_event.set()
+        _vm_register_thread.join()
+        _vm_register_thread = None
 
     # Kill all unresponsive VMs
     if params.get("kill_unresponsive_vms") == "yes":
@@ -757,6 +771,9 @@ def postprocess(test, params, env):
             logging.debug('Image of VM %s was removed, destroing it.', vm.name)
             vm.destroy()
 
+    # Terminate the tcpdump thread
+    env.stop_tcpdump()
+
     # Kill all aexpect tail threads
     aexpect.kill_tail_threads()
 
@@ -769,11 +786,9 @@ def postprocess(test, params, env):
                     m.close()
                 except Exception:
                     pass
-
-    # Terminate tcpdump if no VMs are alive
-    if not living_vms and "tcpdump" in env:
-        env["tcpdump"].close()
-        del env["tcpdump"]
+        # Close the serial console session, as it'll help
+        # keeping the number of filedescriptors used by virt-test honest.
+        vm.cleanup_serial_console()
 
     if params.get("setup_hugepages") == "yes":
         try:
@@ -820,6 +835,16 @@ def postprocess(test, params, env):
         except Exception, details:
             err += "\niscsi cleanup: %s" % str(details).replace('\\n', '\n  ')
             logging.error(details)
+
+    if params.get("storage_type") == "lvm":
+        try:
+            lvmdev = env.get_lvmdev("lvm_%s" % params["main_vm"])
+            lvmdev.cleanup()
+        except Exception, details:
+            err += "\nLVM cleanup: %s" % str(details).replace('\\n', '\n  ')
+            logging.error(details)
+        env.unregister_lvmdev("lvm_%s" % params["main_vm"])
+
     if params.get("storage_type") == "nfs":
         try:
             image_nfs = nfs.Nfs(params)
@@ -858,62 +883,6 @@ def postprocess_on_error(test, params, env):
     params.update(params.object_params("on_error"))
 
 
-def _update_address_cache(address_cache, line):
-    if re.search("Your.IP", line, re.IGNORECASE):
-        matches = re.findall(r"\d*\.\d*\.\d*\.\d*", line)
-        if matches:
-            address_cache["last_seen"] = matches[0]
-
-    if re.search("Client.Ethernet.Address", line, re.IGNORECASE):
-        matches = re.findall(r"\w*:\w*:\w*:\w*:\w*:\w*", line)
-        if matches and address_cache.get("last_seen"):
-            mac_address = matches[0].lower()
-            last_time = address_cache.get("time_%s" % mac_address, 0)
-            last_ip = address_cache.get("last_seen")
-            cached_ip = address_cache.get(mac_address)
-
-            if (time.time() - last_time > 5 or cached_ip != last_ip):
-                logging.debug("(address cache) DHCP lease OK: %s --> %s",
-                              mac_address, address_cache.get("last_seen"))
-
-            address_cache[mac_address] = address_cache.get("last_seen")
-            address_cache["time_%s" % mac_address] = time.time()
-            del address_cache["last_seen"]
-        elif matches:
-            address_cache["last_seen_mac"] = matches[0]
-
-    if re.search("Requested.IP", line, re.IGNORECASE):
-        matches = matches = re.findall(r"\d*\.\d*\.\d*\.\d*", line)
-        if matches and address_cache.get("last_seen_mac"):
-            ip_address = matches[0]
-            mac_address = address_cache.get("last_seen_mac")
-            last_time = address_cache.get("time_%s" % mac_address, 0)
-
-            if time.time() - last_time > 10:
-                logging.debug("(address cache) DHCP lease OK: %s --> %s",
-                              mac_address, ip_address)
-
-            address_cache[mac_address] = ip_address
-            address_cache["time_%s" % mac_address] = time.time()
-            del address_cache["last_seen_mac"]
-
-
-def _tcpdump_handler(address_cache, filename, line):
-    """
-    Helper for handler tcpdump output.
-
-    :params address_cache: address cache path.
-    :params filename: Log file name for tcpdump message.
-    :params line: Tcpdump output message.
-    """
-    try:
-        utils_misc.log_line(filename, line)
-    except Exception, reason:
-        logging.warn("Can't log tcpdump output, '%s'", reason)
-
-    _update_address_cache(address_cache, line)
-
-
 def _take_screendumps(test, params, env):
     global _screendump_thread_termination_event
     temp_dir = test.debugdir
@@ -937,12 +906,13 @@ def _take_screendumps(test, params, env):
 
     while True:
         for vm in env.get_all_vms():
-            if vm not in counter.keys():
-                counter[vm] = 0
-            if vm not in inactivity.keys():
-                inactivity[vm] = time.time()
+            if vm.instance not in counter.keys():
+                counter[vm.instance] = 0
+            if vm.instance not in inactivity.keys():
+                inactivity[vm.instance] = time.time()
             if not vm.is_alive():
                 continue
+            vm_pid = vm.get_pid()
             try:
                 vm.screendump(filename=temp_filename, debug=False)
             except qemu_monitor.MonitorError, e:
@@ -959,17 +929,19 @@ def _take_screendumps(test, params, env):
                 os.unlink(temp_filename)
                 continue
             screendump_dir = os.path.join(test.debugdir,
-                                          "screendumps_%s" % vm.name)
+                                          "screendumps_%s_%s" % (vm.name,
+                                                                 vm_pid))
             try:
                 os.makedirs(screendump_dir)
             except OSError:
                 pass
-            counter[vm] += 1
+            counter[vm.instance] += 1
             screendump_filename = os.path.join(screendump_dir, "%04d.jpg" %
-                                               counter[vm])
+                                               counter[vm.instance])
+            vm.verify_bsod(screendump_filename)
             image_hash = utils.hash_file(temp_filename)
             if image_hash in cache:
-                time_inactive = time.time() - inactivity[vm]
+                time_inactive = time.time() - inactivity[vm.instance]
                 if time_inactive > inactivity_treshold:
                     msg = (
                         "%s screen is inactive for more than %d s (%d min)" %
@@ -981,7 +953,7 @@ def _take_screendumps(test, params, env):
                         except virt_vm.VMScreenInactiveError:
                             logging.error(msg)
                             # Let's reset the counter
-                            inactivity[vm] = time.time()
+                            inactivity[vm.instance] = time.time()
                             test.background_errors.put(sys.exc_info())
                     elif inactivity_watcher == 'log':
                         logging.debug(msg)
@@ -990,7 +962,7 @@ def _take_screendumps(test, params, env):
                 except OSError:
                     pass
             else:
-                inactivity[vm] = time.time()
+                inactivity[vm.instance] = time.time()
                 try:
                     try:
                         image = PIL.Image.open(temp_filename)
@@ -1002,7 +974,7 @@ def _take_screendumps(test, params, env):
                                         "screendump: %s", vm.name, error_detail)
                         # Decrement the counter as we in fact failed to
                         # produce a converted screendump
-                        counter[vm] -= 1
+                        counter[vm.instance] -= 1
                 except NameError:
                     pass
             os.unlink(temp_filename)
@@ -1012,6 +984,74 @@ def _take_screendumps(test, params, env):
                 _screendump_thread_termination_event = None
                 break
             _screendump_thread_termination_event.wait(delay)
+        else:
+            # Exit event was deleted, exit this thread
+            break
+
+
+def store_vm_register(vm, log_filename, append=False):
+    """
+    Store the register information of vm into a log file
+
+    :param vm: VM object
+    :type vm: vm object
+    :param log_filename: log file name
+    :type log_filename: string
+    :param append: Add the log to the end of the log file or not
+    :type append: bool
+    :return: Store the vm register information to log file or not
+    :rtype: bool
+    """
+    try:
+        output = vm.monitor.info('registers', debug=False)
+        timestamp = time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime())
+    except qemu_monitor.MonitorError, e:
+        logging.warn(e)
+        return False
+
+    log_filename = "%s_%s" % (log_filename, timestamp)
+    if append:
+        vr_log = open(log_filename, 'r+')
+        vr_log.seek(0, 2)
+        output += "\n"
+    else:
+        vr_log = open(log_filename, 'w')
+    vr_log.write(output)
+    vr_log.close()
+    return True
+
+
+def _store_vm_register(test, params, env):
+    global _vm_register_thread_termination_event
+    delay = float(params.get("vm_register_delay", 5))
+    counter = {}
+    while True:
+        for vm in env.get_all_vms():
+            if not vm.is_alive():
+                logging.warn("%s is not alive. Can not query the "
+                             "register status" % vm.name)
+                continue
+            vm_pid = vm.get_pid()
+            vr_dir = utils_misc.get_path(test.debugdir,
+                                         "vm_register_%s_%s" % (vm.name,
+                                                                vm_pid))
+            try:
+                os.makedirs(vr_dir)
+            except OSError:
+                pass
+
+            if vm not in counter:
+                counter[vm] = 1
+            vr_filename = utils_misc.get_path(vr_dir, "%04d" % counter[vm])
+            stored_log = store_vm_register(vm, vr_filename)
+            if stored_log:
+                counter[vm] += 1
+
+        if _vm_register_thread_termination_event is not None:
+            if _vm_register_thread_termination_event.isSet():
+                _vm_register_thread_termination_event = None
+                break
+            _vm_register_thread_termination_event.wait(delay)
         else:
             # Exit event was deleted, exit this thread
             break

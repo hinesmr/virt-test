@@ -83,13 +83,25 @@ def get_numa_status(numa_node_info, qemu_pid, debug=True):
 def pin_vm_threads(vm, node):
     """
     Pin VM threads to single cpu of a numa node
-    :param vm: VM object
-    :param node: NumaNode object
+
+    @param vm: VM object
+    @param node: NumaNode object
     """
-    for i in vm.vhost_threads:
-        logging.info("pin vhost thread(%s) to cpu(%s)" % (i, node.pin_cpu(i)))
-    for i in vm.vcpu_threads:
-        logging.info("pin vcpu thread(%s) to cpu(%s)" % (i, node.pin_cpu(i)))
+    if len(vm.vcpu_threads) + len(vm.vhost_threads) < len(node.cpus):
+        for i in vm.vcpu_threads:
+            logging.info("pin vcpu thread(%s) to cpu(%s)" % (i, node.pin_cpu(i)))
+        for i in vm.vhost_threads:
+            logging.info("pin vhost thread(%s) to cpu(%s)" % (i, node.pin_cpu(i)))
+    elif (len(vm.vcpu_threads) <= len(node.cpus) and
+          len(vm.vhost_threads) <= len(node.cpus)):
+        for i in vm.vcpu_threads:
+            logging.info("pin vcpu thread(%s) to cpu(%s)" %
+                         (i, node.pin_cpu(i)))
+        for i in vm.vhost_threads:
+            logging.info("pin vhost thread(%s) to extra cpu(%s)" %
+                         (i, node.pin_cpu(i, extra=True)))
+    else:
+        logging.info("Skip pinning, no enough nodes")
 
 
 def migrate(vm, env=None, mig_timeout=3600, mig_protocol="tcp",

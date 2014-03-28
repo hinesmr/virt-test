@@ -108,6 +108,9 @@ class NetperfPackage(remote.Remote_Package):
     def pack_compile(self, compile_option=""):
         pre_setup_cmd = "cd %s " % self.netperf_base_dir
         pre_setup_cmd += " && %s %s" % (self.decomp_cmd, self.netperf_exec)
+        netperf_dir = self.session.cmd("tar -tf %s | sed -n 1p" %
+                                       self.remote_path).strip()
+        self.netperf_dir = os.path.join(self.netperf_base_dir, netperf_dir)
         pre_setup_cmd += " && cd %s " % self.netperf_dir
         setup_cmd = "./configure %s > /dev/null " % compile_option
         setup_cmd += " && make > /dev/null"
@@ -225,7 +228,8 @@ class NetperfClient(NetperfPackage):
         else:
             self.client_dir = self.remote_path
 
-    def start(self, server_address, test_option="", timeout=1200):
+    def start(self, server_address, test_option="", timeout=1200,
+              cmd_prefix=""):
         """
         Run netperf test
 
@@ -234,8 +238,8 @@ class NetperfClient(NetperfPackage):
         :param timeout: Netperf test timeout(-l)
         :return: return test result
         """
-        netperf_cmd = "%s -H %s %s " % (self.client_dir, server_address,
-                                        test_option)
+        netperf_cmd = "%s %s -H %s %s " % (cmd_prefix, self.client_dir,
+                                           server_address, test_option)
         logging.debug("Start netperf with cmd: '%s'" % netperf_cmd)
         (status, output) = self.session.cmd_status_output(netperf_cmd,
                                                           timeout=timeout)
@@ -244,7 +248,8 @@ class NetperfClient(NetperfPackage):
         self.result = output
         return self.result
 
-    def bg_start(self, server_address, test_option="", session_num=1):
+    def bg_start(self, server_address, test_option="", session_num=1,
+                 cmd_prefix=""):
         """
         Run netperf background, for stress test, Only support linux now
         Have no output
@@ -256,8 +261,8 @@ class NetperfClient(NetperfPackage):
         if self.client == "nc":
             raise NetperfTestError("Currently only support linux client")
 
-        netperf_cmd = "%s -H %s %s " % (self.client_dir, server_address,
-                                        test_option)
+        netperf_cmd = "%s %s -H %s %s " % (cmd_prefix, self.client_dir,
+                                           server_address, test_option)
         logging.debug("Start %s sessions netperf background with cmd: '%s'" %
                       (session_num, netperf_cmd))
         for _ in xrange(int(session_num)):

@@ -122,6 +122,7 @@ def create_monitor(vm, monitor_name, monitor_params):
             monitor_creator = HumanMonitor
 
     monitor_filename = get_monitor_filename(vm, monitor_name)
+    logging.info("Connecting to monitor '%s'", monitor_name)
     monitor = monitor_creator(vm, monitor_name, monitor_filename)
     monitor.verify_responsive()
 
@@ -512,7 +513,7 @@ class HumanMonitor(Monitor):
     """
 
     PROMPT_TIMEOUT = 60
-    CMD_TIMEOUT = 60
+    CMD_TIMEOUT = 120
 
     def __init__(self, vm, name, filename, suppress_exceptions=False):
         """
@@ -1071,6 +1072,26 @@ class HumanMonitor(Monitor):
         cmd = "block_resize device=%s,size=%s" % (device, size)
         return self.send_args_cmd(cmd)
 
+    def eject_cdrom(self, device, force=False):
+        """
+        Eject media of cdrom and open cdrom door;
+        """
+        cmd = "eject"
+        self.verify_supported_cmd(cmd)
+        if force:
+            cmd += " -f "
+        cmd += " %s" % device
+        return self.cmd(cmd)
+
+    def change_media(self, device, target):
+        """
+        Change media of cdrom of drive;
+        """
+        cmd = "change"
+        self.verify_supported_cmd(cmd)
+        cmd += " %s %s" % (device, target)
+        return self.cmd(cmd)
+
 
 class QMPMonitor(Monitor):
 
@@ -1079,8 +1100,8 @@ class QMPMonitor(Monitor):
     """
 
     READ_OBJECTS_TIMEOUT = 5
-    CMD_TIMEOUT = 60
-    RESPONSE_TIMEOUT = 60
+    CMD_TIMEOUT = 120
+    RESPONSE_TIMEOUT = 120
     PROMPT_TIMEOUT = 60
 
     def __init__(self, vm, name, filename, suppress_exceptions=False):
@@ -1118,8 +1139,10 @@ class QMPMonitor(Monitor):
 
             # Read greeting message
             end_time = time.time() + 20
+            output_str = ""
             while time.time() < end_time:
                 for obj in self._read_objects():
+                    output_str += str(obj)
                     if "QMP" in obj:
                         self._greeting = obj
                         break
@@ -1127,7 +1150,8 @@ class QMPMonitor(Monitor):
                     break
                 time.sleep(0.1)
             else:
-                raise MonitorProtocolError("No QMP greeting message received")
+                raise MonitorProtocolError("No QMP greeting message received."
+                                           " Output so far: %s" % output_str)
 
             # Issue qmp_capabilities
             self.cmd("qmp_capabilities")
@@ -1924,3 +1948,21 @@ class QMPMonitor(Monitor):
         """
         cmd = "block_resize device=%s,size=%s" % (device, size)
         return self.send_args_cmd(cmd)
+
+    def eject_cdrom(self, device, force=False):
+        """
+        Eject media of cdrom and open cdrom door;
+        """
+        cmd = "eject"
+        self.verify_supported_cmd(cmd)
+        args = {"device": device, "force": force}
+        return self.cmd(cmd, args)
+
+    def change_media(self, device, target):
+        """
+        Change media of cdrom of drive;
+        """
+        cmd = "change"
+        self.verify_supported_cmd(cmd)
+        args = {"device": device, "target": target}
+        return self.cmd(cmd, args)

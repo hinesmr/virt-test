@@ -78,9 +78,12 @@
 			xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
 			<DriverPaths>
 				<PathAndCredentials wcm:keyValue="1" wcm:action="add">
-					<Path>KVM_TEST_STORAGE_DRIVER_PATH</Path>
+					<Path>KVM_TEST_SCSI_DRIVER_PATH</Path>
 				</PathAndCredentials>
 				<PathAndCredentials wcm:keyValue="2" wcm:action="add">
+					<Path>KVM_TEST_STORAGE_DRIVER_PATH</Path>
+				</PathAndCredentials>
+				<PathAndCredentials wcm:keyValue="3" wcm:action="add">
 					<Path>KVM_TEST_NETWORK_DRIVER_PATH</Path>
 				</PathAndCredentials>
 			</DriverPaths>
@@ -102,6 +105,16 @@
 					<Description>UnfilterAdministratorToken</Description>
 					<Order>2</Order>
 					<Path>cmd /c reg add HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System /v FilterAdministratorToken /t REG_DWORD /d 0 /f</Path>
+				</RunSynchronousCommand>
+				<RunSynchronousCommand wcm:action="add">
+					<Description>SataBootable</Description>
+					<Order>3</Order>
+					<Path>cmd /c reg add HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\Msahci /v Start /t REG_DWORD /d 0 /f</Path>
+				</RunSynchronousCommand>
+				<RunSynchronousCommand wcm:action="add">
+					<Description>SataBootable</Description>
+					<Order>4</Order>
+					<Path>cmd /c reg add HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\IastorV /v Start /t REG_DWORD /d 0 /f</Path>
 				</RunSynchronousCommand>
 			</RunSynchronous>
 		</component>
@@ -195,7 +208,7 @@
 					<Order>14</Order>
 				</SynchronousCommand>
 				<SynchronousCommand wcm:action="add">
-					<CommandLine>%WINDIR%\System32\cmd /c A:\finish.bat PROCESS_CHECK</CommandLine>
+					<CommandLine>%WINDIR%\System32\cmd /c wmic datafile where "filename='finish' and extension='bat'" call copy "c:\\finish.bat" &amp;&amp; c:\finish.bat PROCESS_CHECK</CommandLine>
 					<Order>15</Order>
 				</SynchronousCommand>
 			</FirstLogonCommands>

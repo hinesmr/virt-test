@@ -192,14 +192,14 @@ class Iscsi(object):
         device_name = ""
         if self.logged_in():
             output = utils.system_output(cmd)
-            pattern = r"Target:\s+%s\n.*?disk\s+(\w+)\s+" % self.target
-            if re.findall(pattern, output, re.S):
-                device_name = re.findall(pattern, output, re.S)[0]
-                device_name = "/dev/%s" % device_name
-            else:
-                logging.debug("Can not find taget after login")
+            pattern = r"Target:\s+%s.*?disk\s(\w+)\s+\S+\srunning" % self.target
+            device_name = re.findall(pattern, output, re.S)
+            try:
+                device_name = "/dev/%s" % device_name[0]
+            except IndexError:
+                logging.error("Can not find target '%s' after login.", self.target)
         else:
-            logging.debug("Session is not login yet.")
+            logging.error("Session is not logged in yet.")
         return device_name
 
     def get_target_id(self):
@@ -212,7 +212,7 @@ class Iscsi(object):
         for line in re.split("\n", target_info):
             if re.findall("Target\s+(\d+)", line):
                 target_id = re.findall("Target\s+(\d+)", line)[0]
-            elif re.findall("Backing store path:\s+(/+.+)", line):
+            if re.findall("Backing store path:\s+(/+.+)", line):
                 if self.emulated_image in line:
                     break
         else:
@@ -243,17 +243,35 @@ class Iscsi(object):
             cmd = "tgtadm --mode target --op new --tid %s" % self.emulated_id
             cmd += " --lld iscsi --targetname %s" % self.target
             utils.system(cmd)
-            cmd = "tgtadm --mode logicalunit --op new "
-            cmd += "--tid %s --lld iscsi --lun 1 " % self.emulated_id
-            cmd += "--backing-store %s" % self.emulated_image
-            utils.system(cmd)
             cmd = "tgtadm --lld iscsi --op bind --mode target "
             cmd += "--tid %s -I ALL" % self.emulated_id
             utils.system(cmd)
-            self.export_flag = True
         else:
-            self.emulated_id = re.findall("Target\s+(\d+):\s+%s$" %
-                                          self.target, output)
+            target_strs = re.findall("Target\s+(\d+):\s+%s$" %
+                                     self.target, output, re.M)
+            self.emulated_id = target_strs[0].split(':')[0].split()[-1]
+
+        cmd = "tgtadm --lld iscsi --mode target --op show"
+        try:
+            output = utils.system_output(cmd)
+        except error.CmdError:   # In case service stopped
+            utils.system("service tgtd restart")
+            output = utils.system_output(cmd)
+
+        # Create a LUN with emulated image
+        if re.findall(self.emulated_image, output, re.M):
+            # Exist already
+            logging.debug("Exported image already exists.")
+            self.export_flag = True
+            return
+        else:
+            luns = len(re.findall("\s+LUN:\s(\d+)", output, re.M))
+            cmd = "tgtadm --mode logicalunit --op new "
+            cmd += "--tid %s --lld iscsi " % self.emulated_id
+            cmd += "--lun %s " % luns
+            cmd += "--backing-store %s" % self.emulated_image
+            utils.system(cmd)
+            self.export_flag = True
 
     def delete_target(self):
         """
@@ -278,8 +296,7 @@ class Iscsi(object):
         """
         Clean up env after iscsi used.
         """
-        if self.logged_in():
-            self.logout()
+        self.logout()
         if os.path.isfile("/etc/iscsi/initiatorname.iscsi-%s" % self.id):
             cmd = " mv /etc/iscsi/initiatorname.iscsi-%s" % self.id
             cmd += " /etc/iscsi/initiatorname.iscsi"

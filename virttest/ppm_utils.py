@@ -8,6 +8,16 @@ import os
 import struct
 import time
 import re
+import glob
+import logging
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
+    logging.warning('No python imaging library installed. Windows guest '
+                    'BSOD detection disabled. In order to enable it, '
+                    'please install python-imaging or the equivalent for your '
+                    'distro.')
 try:
     import hashlib
 except ImportError:
@@ -264,3 +274,77 @@ def image_fuzzy_compare(width, height, data1, data2):
             different += 1.0
         i += 3
     return equal / (equal + different)
+
+
+def image_average_hash(image, img_wd=8, img_ht=8):
+    """
+    Resize and convert the image, then get image data as sequence object,
+    calculate the average hash
+    :param image: an image path or an opened image object
+    """
+    if not isinstance(image, Image.Image):
+        image = Image.open(image)
+    image = image.resize((img_wd, img_ht), Image.ANTIALIAS).convert('L')
+    avg = reduce(lambda x, y: x + y, image.getdata()) / (img_wd * img_ht)
+
+    def _hta(i):
+        if i < avg:
+            return 0
+        else:
+            return 1
+    return reduce(lambda x, (y, z): x | (z << y),
+                  enumerate(map(_hta, image.getdata())), 0)
+
+
+def cal_hamming_distance(h1, h2):
+    """
+    Calculate the hamming distance
+    """
+    h_distance, distance = 0, h1 ^ h2
+    while distance:
+        h_distance += 1
+        distance &= distance - 1
+    return h_distance
+
+
+def img_ham_distance(base_img, comp_img):
+    """
+    Calculate two images hamming distance
+    """
+    base_img_ahash = image_average_hash(base_img)
+    comp_img_ahash = image_average_hash(comp_img)
+    return cal_hamming_distance(comp_img_ahash, base_img_ahash)
+
+
+def img_similar(base_img, comp_img, threshold=10):
+    """
+    check whether two images are similar by hamming distance
+    """
+    try:
+        hamming_distance = img_ham_distance(base_img, comp_img)
+    except IOError:
+        return False
+
+    if hamming_distance < threshold:
+        return True
+    else:
+        return False
+
+
+def have_similar_img(base_img, comp_img_path, threshold=10):
+    """
+    Check whether comp_img_path have a image looks like base_img.
+    """
+    support_img_format = ['jpg', 'jpeg', 'gif', 'png', 'pmp']
+    comp_images = []
+    if os.path.isdir(comp_img_path):
+        for ext in support_img_format:
+            comp_images.extend([os.path.join(comp_img_path, x) for x in
+                                glob.glob1(comp_img_path, '*.%s' % ext)])
+    else:
+        comp_images.append(comp_img_path)
+
+    for img in comp_images:
+        if img_similar(base_img, img, threshold):
+            return True
+    return False

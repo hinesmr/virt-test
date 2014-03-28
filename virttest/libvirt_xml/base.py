@@ -1,4 +1,5 @@
 import logging
+import imp
 
 from autotest.client import utils
 from virttest import propcan, xml_utils, virsh
@@ -66,6 +67,16 @@ class LibvirtXMLBase(propcan.PropCanBase):
             except xcepts.LibvirtXMLNotFoundError:
                 pass  # Unset virtual values won't have keys
         return dict_1 == dict_2
+
+    def __contains__(self, key):
+        """
+        Also hide any Libvirt_xml API exceptions behind standard python behavior
+        """
+        try:
+            return super(LibvirtXMLBase, self).__contains__(key)
+        except xcepts.LibvirtXMLError:
+            return False
+        return True
 
     def set_virsh(self, value):
         """Accessor method for virsh property, make sure it's right type"""
@@ -187,3 +198,36 @@ class LibvirtXMLBase(propcan.PropCanBase):
             command += ' %s' % schema_name
         cmdresult = utils.run(command, ignore_status=True)
         return cmdresult
+
+
+def load_xml_module(path, name, type_list):
+    """
+    Returns named xml element's handler class
+
+    :param path: the xml module path
+    :param name: the xml module name
+    :param type_list: the supported type list of xml module names
+    :return: the named xml element's handler class
+    """
+    # Module names and tags are always all lower-case
+    name = str(name).lower()
+    errmsg = ("Unknown/unsupported type '%s', supported types %s"
+              % (str(name), type_list))
+    if name not in type_list:
+        raise xcepts.LibvirtXMLError(errmsg)
+    try:
+        filename, pathname, description = imp.find_module(name,
+                                                          [path])
+        mod_obj = imp.load_module(name, filename, pathname, description)
+        # Enforce capitalized class names
+        return getattr(mod_obj, name.capitalize())
+    except TypeError, detail:
+        raise xcepts.LibvirtXMLError(errmsg + ': %s' % str(detail))
+    except ImportError, detail:
+        raise xcepts.LibvirtXMLError("Can't find module %s in %s: %s"
+                                     % (name, path, str(detail)))
+    except AttributeError, detail:
+        raise xcepts.LibvirtXMLError("Can't find class %s in %s module in "
+                                     "%s: %s"
+                                     % (name.capitalize(), name, pathname,
+                                        str(detail)))

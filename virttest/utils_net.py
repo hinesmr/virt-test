@@ -73,6 +73,38 @@ class TAPCreationError(NetError):
         return e_msg
 
 
+class MacvtapCreationError(NetError):
+
+    def __init__(self, ifname, base_interface, details=None):
+        NetError.__init__(self, ifname, details)
+        self.ifname = ifname
+        self.interface = base_interface
+        self.details = details
+
+    def __str__(self):
+        e_msg = "Cannot create macvtap device %s " % self.ifname
+        e_msg += "base physical interface %s." % self.interface
+        if self.details is not None:
+            e_msg += ": %s" % self.details
+        return e_msg
+
+
+class MacvtapGetBaseInterfaceError(NetError):
+
+    def __init__(self, ifname=None, details=None):
+        NetError.__init__(self, ifname, details)
+        self.ifname = ifname
+        self.details = details
+
+    def __str__(self):
+        e_msg = "Cannot get a valid physical interface to create macvtap."
+        if self.ifname:
+            e_msg += "physical interface is : %s " % self.ifname
+        if self.details is not None:
+            e_msg += "error info: %s" % self.details
+        return e_msg
+
+
 class TAPBringUpError(NetError):
 
     def __init__(self, ifname):
@@ -182,6 +214,26 @@ class BRIpError(NetError):
                (self.brname))
 
 
+class VMIPV6NeighNotFoundError(NetError):
+
+    def __init__(self, ipv6_address):
+        NetError.__init__(self, ipv6_address)
+        self.ipv6_address = ipv6_address
+
+    def __str__(self):
+        return "No IPV6 neighbours with address %s" % self.ipv6_address
+
+
+class VMIPV6AdressError(NetError):
+
+    def __init__(self, error_info):
+        NetError.__init__(self, error_info)
+        self.error_info = error_info
+
+    def __str__(self):
+        return "%s, check your test env supports IPV6" % self.error_info
+
+
 class HwAddrSetError(NetError):
 
     def __init__(self, ifname, mac):
@@ -201,6 +253,19 @@ class HwAddrGetError(NetError):
 
     def __str__(self):
         return "Can not get mac of interface %s" % self.ifname
+
+
+class IPAddrGetError(NetError):
+
+    def __init__(self, mac_addr, details=None):
+        NetError.__init__(self, mac_addr)
+        self.mac_addr = mac_addr
+        self.details = details
+
+    def __str__(self):
+        details_msg = "Get guest nic ['%s'] IP address error" % self.mac_addr
+        details_msg += "error info: %s" % self.details
+        return details_msg
 
 
 class HwOperstarteGetError(NetError):
@@ -402,7 +467,7 @@ class Interface(object):
         """
         Get the status information of the Interface
         """
-        spl_re = re.compile("\s+")
+        spl_re = re.compile(r"\s+")
 
         fp = open(PROCFS_NET_PATH)
         # Skip headers
@@ -469,11 +534,9 @@ class Macvtap(Interface):
         :param mode: Creation mode.
         """
         path = os.path.join(SYSFS_NET_PATH, self.tapname)
-        if os.path.exists(path):
-            return
-
-        self.ip_link_ctl(["link", "add", "link", device, "name",
-                          self.tapname, "type", "macvtap", "mode", mode])
+        if not os.path.exists(path):
+            self.ip_link_ctl(["link", "add", "link", device, "name",
+                             self.tapname, "type", "macvtap", "mode", mode])
 
     def delete(self):
         path = os.path.join(SYSFS_NET_PATH, self.tapname)
@@ -488,27 +551,29 @@ class Macvtap(Interface):
             raise TAPModuleError(device, "open", e)
 
 
-def add_nic_macvtap(nic, base_interface=None):
+def get_macvtap_base_iface(base_interface=None):
     """
-    Add a macvtap nic, if you not have a macvtap switch in you env, run
-    this type case you need at least two nic on you host
-    If you not assign the base_interface will use the first physical interface
-    which is not a brport and up to create macvtap
+    Get physical interface to create macvtap, if you assigned base interface
+    is valid(not belong to any bridge and is up), will use it; else use the
+    first physical interface,  which is not a brport and up.
     """
     tap_base_device = None
 
     (dev_int, _) = get_sorted_net_if()
     if not dev_int:
-        raise TAPCreationError("Cannot get a physical interface on the host")
+        err_msg = "Cannot get any physical interface from the host"
+        raise MacvtapGetBaseInterfaceError(details=err_msg)
 
-    if base_interface:
-        if not base_interface in dev_int:
-            err_msg = "Macvtap must created base on a physical interface"
-            raise TAPCreationError(err_msg)
+    if base_interface and base_interface in dev_int:
         base_inter = Interface(base_interface)
         if (not base_inter.is_brport()) and base_inter.is_up():
             tap_base_device = base_interface
-    else:
+
+    if not tap_base_device:
+        if base_interface:
+            warn_msg = "Can not use '%s' as macvtap base interface, "
+            warn_msg += "will choice automatically"
+            logging.warn(warn_msg % base_interface)
         for interface in dev_int:
             base_inter = Interface(interface)
             if base_inter.is_brport():
@@ -521,17 +586,63 @@ def add_nic_macvtap(nic, base_interface=None):
         err_msg = ("Could not find a valid physical interface to create "
                    "macvtap, make sure the interface is up and it does not "
                    "belong to any bridge.")
-        raise TAPCreationError(nic.ifname, err_msg)
+        raise MacvtapGetBaseInterfaceError(details=err_msg)
+    return tap_base_device
 
+
+def create_macvtap(ifname, mode="vepa", base_if=None, mac_addr=None):
+    """
+    Create Macvtap device, return a object of Macvtap
+
+    :param ifname: macvtap interface name
+    :param mode:  macvtap type mode ("vepa, bridge,..)
+    :param base_if: physical interface to create macvtap
+    :param mac_addr: macvtap mac address
+    """
+    try:
+        base_if = get_macvtap_base_iface(base_if)
+        o_macvtap = Macvtap(ifname)
+        o_macvtap.create(base_if, mode)
+        if mac_addr:
+            o_macvtap.set_mac(mac_addr)
+        return o_macvtap
+    except Exception, e:
+        raise MacvtapCreationError(ifname, base_if, e)
+
+
+def open_macvtap(macvtap_object, queues=1):
+    """
+    Open a macvtap device and returns its file descriptors which are used by
+    fds=<fd1:fd2:..> parameter of qemu
+
+    For single queue, only returns one file descriptor, it's used by
+    fd=<fd> legacy parameter of qemu
+
+    If you not have a switch support vepa in you env, run this type case you
+    need at least two nic on you host [just workaround]
+
+    :param macvtap_object:  macvtap object
+    :param queues: Queue number
+    """
     tapfds = []
-    tap = Macvtap(nic.ifname)
-    tap.create(tap_base_device)
-    tap.set_mac(nic.mac)
-    for queue in range(int(nic.queues)):
-        tapfds.append(str(tap.open()))
-    nic.tapfds = ":".join(tapfds)
-    time.sleep(3)
-    tap.up()
+    for queue in range(int(queues)):
+        tapfds.append(str(macvtap_object.open()))
+    return ":".join(tapfds)
+
+
+def create_and_open_macvtap(ifname, mode="vepa", queues=1, base_if=None,
+                            mac_addr=None):
+    """
+    Create a new macvtap device, open it, and return the fds
+
+    :param ifname: macvtap interface name
+    :param mode:  macvtap type mode ("vepa, bridge,..)
+    :param queues: Queue number
+    :param base_if: physical interface to create macvtap
+    :param mac_addr: macvtap mac address
+    """
+    o_macvtap = create_macvtap(ifname, mode, base_if, mac_addr)
+    return open_macvtap(o_macvtap, queues)
 
 
 class Bridge(object):
@@ -540,10 +651,10 @@ class Bridge(object):
         """
         Get bridge list.
         """
-        ebr_i = re.compile("^(\S+).*?\s+$", re.MULTILINE)
-        br_i = re.compile("^(\S+).*?(\S+)$", re.MULTILINE)
-        nbr_i = re.compile("^\s+(\S+)$", re.MULTILINE)
-        out_line = (utils.run("brctl show", verbose=False).stdout.splitlines())
+        ebr_i = re.compile(r"^(\S+).*?\s+$", re.MULTILINE)
+        br_i = re.compile(r"^(\S+).*?(\S+)$", re.MULTILINE)
+        nbr_i = re.compile(r"^\s+(\S+)$", re.MULTILINE)
+        out_line = (utils.run(r"brctl show", verbose=False).stdout.splitlines())
         result = dict()
         bridge = None
         iface = None
@@ -572,6 +683,15 @@ class Bridge(object):
 
     def list_br(self):
         return self.get_structure().keys()
+
+    def list_iface(self):
+        """
+        Return all interfaces used by bridge.
+        """
+        interface_list = []
+        for value in self.get_structure().values():
+            interface_list += value
+        return list(set(interface_list))
 
     def port_to_br(self, port_name):
         """
@@ -633,8 +753,7 @@ def __init_openvswitch(func):
                 if (not __ovs.check()):
                     raise Exception("Check of OpenVSwitch failed.")
             except Exception, e:
-                logging.debug("System not support OpenVSwitch:")
-                logging.debug(e)
+                logging.debug("Host does not support OpenVSwitch: %s", e)
 
         return func(*args, **kargs)
     return wrap_init
@@ -771,7 +890,7 @@ def local_runner_status(cmd, timeout=None):
     return utils.run(cmd, verbose=False, timeout=timeout).exit_status
 
 
-def get_net_if(runner=None):
+def get_net_if(runner=None, state=None):
     """
     :param runner: command runner.
     :param div_phy_virt: if set true, will return a tuple division real
@@ -780,9 +899,13 @@ def get_net_if(runner=None):
     """
     if runner is None:
         runner = local_runner
+    if state is None:
+        state = ".*"
     cmd = "ip link"
     result = runner(cmd)
-    return re.findall("^\d+: (\S+?)[@:].*$", result, re.MULTILINE)
+    return re.findall(r"^\d+: (\S+?)[@:].*state %s.*$" % (state),
+                      result,
+                      re.MULTILINE)
 
 
 def get_sorted_net_if():
@@ -822,6 +945,21 @@ def get_net_if_addrs(if_name, runner=None):
             "mac": re.findall("link/ether (.+?) ", result, re.MULTILINE)}
 
 
+def get_net_if_addrs_win(session, mac_addr):
+    """
+    Try to get windows guest nic address by serial session
+
+    :param session: serial sesssion
+    :param mac_addr:  guest nic mac address
+    :return: List ip addresses of network interface.
+    """
+    ip_address = get_windows_nic_attribute(session, "macaddress",
+                                           mac_addr, "IPAddress",
+                                           global_switch="nicconfig")
+    return {"ipv4": re.findall('(\d+.\d+.\d+.\d+)"', ip_address),
+            "ipv6": re.findall('(fe80.*?)"', ip_address)}
+
+
 def get_net_if_and_addrs(runner=None):
     """
     :return: Dict of interfaces and their addresses {"ifname": addrs}.
@@ -831,6 +969,70 @@ def get_net_if_and_addrs(runner=None):
     for iface in ifs:
         ret[iface] = get_net_if_addrs(iface, runner)
     return ret
+
+
+def get_guest_ip_addr(session, mac_addr, os_type="linux", ip_version="ipv4",
+                      linklocal=False):
+    """
+    Get guest ip addresses by serial session
+
+    :param session: serial session
+    :param mac_addr: nic mac address of the nic that you want get
+    :param os_type: guest os type, windows or linux
+    :param ip_version: guest ip version, ipv4 or ipv6
+    :param linklocal: Wether ip address is local or remote
+    :return: ip addresses of network interface.
+    """
+    if ip_version == "ipv6" and linklocal:
+        return ipv6_from_mac_addr(mac_addr)
+    try:
+        if os_type == "linux":
+            nic_ifname = get_linux_ifname(session, mac_addr)
+            info_cmd = "ifconfig -a; ethtool -S %s" % nic_ifname
+            nic_address = get_net_if_addrs(nic_ifname, session.cmd)
+        elif os_type == "windows":
+            info_cmd = "ipconfig /all"
+            nic_address = get_net_if_addrs_win(session, mac_addr)
+        else:
+            info_cmd = ""
+            raise IPAddrGetError(mac_addr, "Unknown os type")
+
+        if ip_version == "ipv4":
+            return nic_address["ipv4"][-1]
+        else:
+            global_address = [x for x in nic_address["ipv6"]
+                              if not x.lower().startswith("fe80")]
+            if global_address:
+                return global_address[0]
+    except Exception, err:
+        logging.debug(session.cmd_output(info_cmd))
+        raise IPAddrGetError(mac_addr, err)
+
+
+def renew_guest_ip(session, mac_addr, os_type="linux", ip_version="ipv4"):
+    """
+    Renew guest ip by serial session
+
+    :param session: serial session
+    :param mac_addr: nic mac address of the nic that you want renew
+    :param os_type: guest os type, windows or linux
+    :param ip_version: guest ip version, ipv4 or ipv6
+    """
+    if os_type == "linux":
+        nic_ifname = get_linux_ifname(session, mac_addr)
+        renew_cmd = "ifconfig %s up; " % nic_ifname
+        renew_cmd += "pidof dhclient && killall dhclient; "
+        if ip_version == "ipv6":
+            renew_cmd += "dhclient -6 %s &" % nic_ifname
+        else:
+            renew_cmd += "dhclient %s &" % nic_ifname
+    elif os_type == "windows":
+        nic_connectionid = get_windows_nic_attribute(session,
+                                                     "macaddress", mac_addr,
+                                                     "netconnectionid")
+        renew_cmd = 'ipconfig /renew "%s"' % nic_connectionid
+
+    session.cmd_output_safe(renew_cmd)
 
 
 def set_net_if_ip(if_name, ip_addr, runner=None):
@@ -881,7 +1083,76 @@ def ipv6_from_mac_addr(mac_addr):
     """
     mp = mac_addr.split(":")
     mp[0] = ("%x") % (int(mp[0], 16) ^ 0x2)
-    return "fe80::%s%s:%sff:fe%s:%s%s" % tuple(mp)
+    mac_address = "fe80::%s%s:%sff:fe%s:%s%s" % tuple(mp)
+    return ":".join(map(lambda x: x.lstrip("0"), mac_address.split(":")))
+
+
+def refresh_neigh_table(interface_name=None, neigh_address="ff02::1"):
+    """
+    Refresh host neighbours table, if interface_name is assigned only refresh
+    neighbours of this interface, else refresh the all the neighbours.
+    """
+    if isinstance(interface_name, list):
+        interfaces = interface_name
+    elif isinstance(interface_name, str):
+        interfaces = interface_name.split()
+    else:
+        interfaces = filter(lambda x: "-" not in x, get_net_if())
+        interfaces.remove("lo")
+
+    for interface in interfaces:
+        refresh_cmd = "ping6 -c 2 -I %s %s > /dev/null" % (interface,
+                                                           neigh_address)
+        utils.system(refresh_cmd, ignore_status=True)
+
+
+def get_neighbours_info(neigh_address="", interface_name=None):
+    """
+    Get the neighbours infomation
+    """
+    refresh_neigh_table(interface_name, neigh_address)
+    cmd = "ip -6 neigh show nud reachable"
+    if neigh_address:
+        cmd += " %s" % neigh_address
+    output = utils.system_output(cmd)
+    if not output:
+        raise VMIPV6NeighNotFoundError(neigh_address)
+    all_neigh = {}
+    neigh_info = {}
+    for line in output.splitlines():
+        neigh_address = line.split()[0]
+        neigh_info["address"] = neigh_address
+        neigh_info["attach_if"] = line.split()[2]
+        neigh_mac = line.split()[4]
+        neigh_info["mac"] = neigh_mac
+        all_neigh[neigh_mac] = neigh_info
+        all_neigh[neigh_address] = neigh_info
+    return all_neigh
+
+
+def neigh_reachable(neigh_address, attach_if=None):
+    """
+    Check the neighbour is reachable
+    """
+    try:
+        get_neighbours_info(neigh_address, attach_if)
+    except VMIPV6NeighNotFoundError:
+        return False
+    return True
+
+
+def get_neigh_attch_interface(neigh_address):
+    """
+    Get the interface wihch can reach the neigh_address
+    """
+    return get_neighbours_info(neigh_address)[neigh_address]["attach_if"]
+
+
+def get_neigh_mac(neigh_address):
+    """
+    Get neighbour mac by his address
+    """
+    return get_neighbours_info(neigh_address)[neigh_address]["mac"]
 
 
 def check_add_dnsmasq_to_br(br_name, tmpdir):
@@ -1137,7 +1408,7 @@ def if_set_macaddress(ifname, mac):
     ctrl_sock.close()
 
 
-class VirtIface(propcan.PropCan):
+class VirtIface(propcan.PropCan, object):
 
     """
     Networking information for single guest interface and host connection.
@@ -1680,6 +1951,19 @@ class DbNet(VMNet):
         except AttributeError:
             raise DbNoLockError
 
+ADDRESS_POOL_FILENAME = os.path.join("/tmp", "address_pool")
+ADDRESS_POOL_LOCK_FILENAME = ADDRESS_POOL_FILENAME + ".lock"
+
+
+def clean_tmp_files():
+    """
+    Remove the base address pool filename.
+    """
+    if os.path.isfile(ADDRESS_POOL_LOCK_FILENAME):
+        os.unlink(ADDRESS_POOL_LOCK_FILENAME)
+    if os.path.isfile(ADDRESS_POOL_FILENAME):
+        os.unlink(ADDRESS_POOL_FILENAME)
+
 
 class VirtNet(DbNet, ParamsNet):
 
@@ -1691,7 +1975,7 @@ class VirtNet(DbNet, ParamsNet):
     # and take steps to preserve or update it as appropriate.
 
     def __init__(self, params, vm_name, db_key,
-                 db_filename="/tmp/address_pool"):
+                 db_filename=ADDRESS_POOL_FILENAME):
         """
         Load networking info. from db, then from params, then update db.
 
@@ -1874,7 +2158,7 @@ def verify_ip_address_ownership(ip, macs, timeout=10.0):
     # Get the name of the bridge device for arping
     o = commands.getoutput("%s route get %s" %
                            (utils_misc.find_command("ip"), ip))
-    dev = re.findall("dev\s+\S+", o, re.IGNORECASE)
+    dev = re.findall(r"dev\s+\S+", o, re.IGNORECASE)
     if not dev:
         return False
     dev = dev[0].split()[-1]
@@ -1933,6 +2217,20 @@ def get_host_ip_address(params):
     return host_ip
 
 
+def get_correspond_ip(remote_ip):
+    """
+    Get local ip address which is used to contact remote ip.
+
+    :param remote_ip: Remote ip
+    :return: Local corespond IP.
+    """
+    result = utils.run("ip route get %s" % (remote_ip)).stdout
+    local_ip = re.search("src (.+)", result)
+    if local_ip is not None:
+        local_ip = local_ip.groups()[0]
+    return local_ip
+
+
 def get_linux_ifname(session, mac_address=""):
     """
     Get the interface name through the mac address.
@@ -1958,7 +2256,7 @@ def get_linux_ifname(session, mac_address=""):
             return None
 
     # Try ifconfig first
-    i = _process_output("ifconfig -a", "(\w+)\s+Link.*%s" % mac_address)
+    i = _process_output("ifconfig -a", r"(\w+)\s+Link.*%s" % mac_address)
     if i is not None:
         return i
 
@@ -2015,34 +2313,38 @@ def update_mac_ip_address(vm, params, timeout=None):
     session = vm.wait_for_serial_login(timeout=360)
     end_time = time.time() + timeout
     macs_ips = []
-    i = 0
+    num = 0
     while time.time() < end_time:
         try:
-            if i % 3 == 0:
+            if num % 3 == 0 and num != 0:
                 session.cmd(restart_network)
-            o = session.cmd_status_output(network_query)[1]
-            macs_ips = re.findall(mac_ip_filter, o)
+            output = session.cmd_status_output(network_query)[1]
+            macs_ips = re.findall(mac_ip_filter, output, re.S)
             # Get nics number
-        except Exception, e:
-            logging.warn(e)
+        except Exception, err:
+            logging.error(err)
         nics = params.get("nics")
-        nic_minimum = len(re.split("\s+", nics.strip()))
+        nic_minimum = len(re.split(r"\s+", nics.strip()))
         if len(macs_ips) == nic_minimum:
             break
-        i += 1
+        num += 1
         time.sleep(5)
     if len(macs_ips) < nic_minimum:
-        logging.warn("Not all nics get ip address")
+        logging.error("Not all nics get ip address")
 
-    for (mac, ip) in macs_ips:
-        vlan = macs_ips.index((mac, ip))
+    for (_ip, mac) in macs_ips:
+        vlan = macs_ips.index((_ip, mac))
+        # _ip, mac are in different sequence in Fedora and RHEL guest.
+        if re.match(".\d+\.\d+\.\d+\.\d+", mac):
+            _ip, mac = mac, _ip
         if "-" in mac:
             mac = mac.replace("-", ".")
-        vm.address_cache[mac.lower()] = ip
+        vm.address_cache[mac.lower()] = _ip
         vm.virtnet.set_mac_address(vlan, mac)
 
 
-def get_windows_nic_attribute(session, key, value, target, timeout=240):
+def get_windows_nic_attribute(session, key, value, target, timeout=240,
+                              global_switch="nic"):
     """
     Get the windows nic attribute using wmic. All the support key you can
     using wmic to have a check.
@@ -2053,10 +2355,11 @@ def get_windows_nic_attribute(session, key, value, target, timeout=240):
     :param target: which nic attribute you want to get.
 
     """
-    cmd = 'wmic nic where %s="%s" get %s' % (key, value, target)
+    cmd = 'wmic %s where %s="%s" get %s' % (global_switch, key, value, target)
     o = session.cmd(cmd, timeout=timeout).strip()
     if not o:
-        raise error.TestError("Get guest nic attribute %s failed!" % target)
+        err_msg = "Get guest %s attribute %s failed!" % (global_switch, target)
+        raise error.TestError(err_msg)
     return o.splitlines()[-1]
 
 

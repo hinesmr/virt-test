@@ -12,8 +12,18 @@ import select
 import termios
 import fcntl
 import tempfile
+import logging
+import shutil
 
-BASE_DIR = os.path.join('/tmp', 'aexpect_spawn')
+BASE_DIR = os.path.join('/tmp', 'aexpect')
+
+
+def clean_tmp_files():
+    """
+    Remove all aexpect temporary files.
+    """
+    if os.path.isdir(BASE_DIR):
+        shutil.rmtree(BASE_DIR, ignore_errors=True)
 
 # The following helper functions are shared by the server and the client.
 
@@ -52,13 +62,14 @@ def _wait(filename):
 
 
 def _get_filenames(base_dir, a_id):
-    return [os.path.join(base_dir, s + a_id) for s in
-            "shell-pid-", "status-", "output-", "inpipe-",
-            "lock-server-running-", "lock-client-starting-"]
+    return [os.path.join(base_dir, a_id, s) for s in
+            "shell-pid", "status", "output", "inpipe",
+            "lock-server-running", "lock-client-starting",
+            "server-log"]
 
 
 def _get_reader_filename(base_dir, a_id, reader):
-    return os.path.join(base_dir, "outpipe-%s-%s" % (reader, a_id))
+    return os.path.join(base_dir, a_id, "outpipe-%s" % reader)
 
 
 # The following is the server part of the module.
@@ -75,7 +86,19 @@ if __name__ == "__main__":
      output_filename,
      inpipe_filename,
      lock_server_running_filename,
-     lock_client_starting_filename) = _get_filenames(BASE_DIR, a_id)
+     lock_client_starting_filename,
+     log_filename) = _get_filenames(BASE_DIR, a_id)
+
+    logging_format = '%(asctime)s %(levelname)-5.5s| %(message)s'
+    date_format = '%m/%d %H:%M:%S'
+    logging.basicConfig(filename=log_filename, level=logging.DEBUG,
+                        format=logging_format, datefmt=date_format)
+    server_log = logging.getLogger()
+
+    server_log.info('Server %s starting with parameters:' % str(a_id))
+    server_log.info('echo: %s' % str(echo))
+    server_log.info('readers: %s' % str(readers))
+    server_log.info('command: %s' % str(command))
 
     # Populate the reader filenames list
     reader_filenames = [_get_reader_filename(BASE_DIR, a_id, reader)
@@ -83,6 +106,8 @@ if __name__ == "__main__":
 
     # Set $TERM = dumb
     os.putenv("TERM", "dumb")
+
+    server_log.info('Forking child process for command')
 
     (shell_pid, shell_fd) = pty.fork()
     if shell_pid == 0:
@@ -96,8 +121,9 @@ if __name__ == "__main__":
                 new_stack = (1 + len(command) / 2072576) * 8196
                 command = "ulimit -s %s\nulimit -n 819200\n%s" % (new_stack,
                                                                   command)
+            tmp_dir = os.path.join(BASE_DIR, a_id)
             tmp_file = tempfile.mktemp(suffix='.sh',
-                                       prefix='autotest', dir="/tmp")
+                                       prefix='aexpect-', dir=tmp_dir)
             fd_cmd = open(tmp_file, "w")
             fd_cmd.write(command)
             fd_cmd.close()
@@ -107,6 +133,7 @@ if __name__ == "__main__":
             os.execv("/bin/bash", ["/bin/bash", "-c", command])
     else:
         # Parent process
+        server_log.info('Acquiring server lock on %s' % lock_server_running_filename)
         lock_server_running = _lock(lock_server_running_filename)
 
         # Set terminal echo on/off and disable pre- and post-processing
@@ -121,18 +148,21 @@ if __name__ == "__main__":
             attr[3] &= ~termios.ECHO
         termios.tcsetattr(shell_fd, termios.TCSANOW, attr)
 
-        # Open output file
+        server_log.info('Opening output file %s' % output_filename)
         output_file = open(output_filename, "w")
-        # Open input pipe
+        server_log.info('Opening input pipe %s' % inpipe_filename)
         os.mkfifo(inpipe_filename)
         inpipe_fd = os.open(inpipe_filename, os.O_RDWR)
         # Open output pipes (readers)
         reader_fds = []
         for filename in reader_filenames:
+            server_log.info('Opening output pipe %s' % filename)
             os.mkfifo(filename)
             reader_fds.append(os.open(filename, os.O_RDWR))
+        server_log.info('Reader fd list: %s' % reader_fds)
 
         # Write shell PID to file
+        server_log.info('Writing shell PID file %s' % shell_pid_filename)
         fileobj = open(shell_pid_filename, "w")
         fileobj.write(str(shell_pid))
         fileobj.close()
@@ -145,6 +175,7 @@ if __name__ == "__main__":
         buffers = ["" for reader in readers]
 
         # Read from child and write to files/pipes
+        server_log.info('Entering main read loop')
         while True:
             check_termination = False
             # Make a list of reader pipes whose buffers are not empty
@@ -182,7 +213,7 @@ if __name__ == "__main__":
                 data = os.read(inpipe_fd, 1024)
                 os.write(shell_fd, data)
 
-        # Write the exit status to a file
+        server_log.info('Out of the main read loop. Writing status to %s' % status_filename)
         fileobj = open(status_filename, "w")
         fileobj.write(str(status))
         fileobj.close()
@@ -190,20 +221,16 @@ if __name__ == "__main__":
         # Wait for the client to finish initializing
         _wait(lock_client_starting_filename)
 
-        # Delete FIFOs
-        for filename in [inpipe_filename]:
-            try:
-                os.unlink(filename)
-            except OSError:
-                pass
-
         # Close all files and pipes
         output_file.close()
         os.close(inpipe_fd)
+        server_log.info('Closed input pipe')
         for fd in reader_fds:
             os.close(fd)
+            server_log.info('Closed reader fd %s' % fd)
 
         _unlock(lock_server_running)
+        server_log.info('Exiting normally')
         sys.exit(0)
 
 
@@ -307,6 +334,44 @@ class ShellStatusError(ShellError):
     def __str__(self):
         return ("Could not get exit status of command: %r    (output: %r)" %
                 (self.cmd, self.output))
+
+
+def run_tail(command, termination_func=None, output_func=None, output_prefix="",
+             timeout=1.0, auto_close=True):
+    """
+    Run command as a subprocess.  Call output_func with each line of output
+    from the subprocess (prefixed by output_prefix).  Call termination_func
+    when the subprocess terminates.  Return when timeout expires or when the
+    subprocess exits -- whichever occurs first.
+
+    @brief: Run a subprocess in the background and collect its output and
+            exit status.
+
+    :param command: The shell command to execute
+    :param termination_func: A function to call when the process terminates
+            (should take an integer exit status parameter)
+    :param output_func: A function to call with each line of output from
+            the subprocess (should take a string parameter)
+    :param output_prefix: A string to pre-pend to each line of the output,
+            before passing it to stdout_func
+    :param timeout: Time duration (in seconds) to wait for the subprocess to
+            terminate before returning
+    :param auto_close: If True, close() the instance automatically when its
+                reference count drops to zero (default False).
+
+    :return: A Expect object.
+    """
+    process = Tail(command=command,
+                   termination_func=termination_func,
+                   output_func=output_func,
+                   output_prefix=output_prefix,
+                   auto_close=auto_close)
+
+    end_time = time.time() + timeout
+    while time.time() < end_time and process.is_alive():
+        time.sleep(0.1)
+
+    return process
 
 
 def run_bg(command, termination_func=None, output_func=None, output_prefix="",
@@ -429,9 +494,11 @@ class Spawn(object):
         self.a_id = a_id or utils_misc.generate_random_string(8)
         self.log_file = None
 
+        base_dir = os.path.join(BASE_DIR, self.a_id)
+
         # Define filenames for communication with server
         try:
-            os.makedirs(BASE_DIR)
+            os.makedirs(base_dir)
         except Exception:
             pass
         (self.shell_pid_filename,
@@ -439,8 +506,9 @@ class Spawn(object):
          self.output_filename,
          self.inpipe_filename,
          self.lock_server_running_filename,
-         self.lock_client_starting_filename) = _get_filenames(BASE_DIR,
-                                                              self.a_id)
+         self.lock_client_starting_filename,
+         self.server_log_filename) = _get_filenames(BASE_DIR,
+                                                    self.a_id)
 
         # Remember some attributes
         self.auto_close = auto_close
@@ -617,6 +685,12 @@ class Spawn(object):
         """
         return _locked(self.lock_server_running_filename)
 
+    def is_defunct(self):
+        """
+        Return True if the process is defunct (zombie).
+        """
+        return utils_misc.process_or_children_is_defunct(self.get_pid())
+
     def kill(self, sig=signal.SIGKILL):
         """
         Kill the child process if alive
@@ -688,6 +762,7 @@ def kill_tail_threads():
     """
     global _thread_kill_requested
     _thread_kill_requested = True
+
     for t in threading.enumerate():
         if hasattr(t, "name") and t.name.startswith("tail_thread"):
             t.join(10)
@@ -712,7 +787,8 @@ class Tail(Spawn):
 
     def __init__(self, command=None, a_id=None, auto_close=False, echo=False,
                  linesep="\n", termination_func=None, termination_params=(),
-                 output_func=None, output_params=(), output_prefix=""):
+                 output_func=None, output_params=(), output_prefix="",
+                 thread_name=None):
         """
         Initialize the class and run command as a child process.
 
@@ -738,6 +814,7 @@ class Tail(Spawn):
         :param output_params: Parameters to send to output_func before the
                 output line.
         :param output_prefix: String to prepend to lines sent to output_func.
+        :param thread_name: Name of thread to better identify hanging threads.
         """
         # Add a reader and a close hook
         self._add_reader("tail")
@@ -746,6 +823,11 @@ class Tail(Spawn):
 
         # Init the superclass
         Spawn.__init__(self, command, a_id, auto_close, echo, linesep)
+        if thread_name is None:
+            self.thread_name = ("tail_thread_%s_%s") % (self.a_id,
+                                                        str(command)[:10])
+        else:
+            self.thread_name = thread_name
 
         # Remember some attributes
         self.termination_func = termination_func
@@ -767,7 +849,8 @@ class Tail(Spawn):
                                               self.termination_params,
                                               self.output_func,
                                               self.output_params,
-                                              self.output_prefix)
+                                              self.output_prefix,
+                                              self.thread_name)
 
     def set_termination_func(self, termination_func):
         """
@@ -847,6 +930,10 @@ class Tail(Spawn):
             while True:
                 global _thread_kill_requested
                 if _thread_kill_requested:
+                    try:
+                        os.close(fd)
+                    except:
+                        pass
                     return
                 try:
                     # See if there's any data to read from the pipe
@@ -891,7 +978,7 @@ class Tail(Spawn):
 
     def _start_thread(self):
         self.tail_thread = threading.Thread(target=self._tail,
-                                            name="tail_thread_%s" % self.a_id)
+                                            name=self.thread_name)
         self.tail_thread.start()
 
     def _join_thread(self):
@@ -914,7 +1001,8 @@ class Expect(Tail):
 
     def __init__(self, command=None, a_id=None, auto_close=True, echo=False,
                  linesep="\n", termination_func=None, termination_params=(),
-                 output_func=None, output_params=(), output_prefix=""):
+                 output_func=None, output_params=(), output_prefix="",
+                 thread_name=None):
         """
         Initialize the class and run command as a child process.
 
@@ -947,7 +1035,7 @@ class Expect(Tail):
         # Init the superclass
         Tail.__init__(self, command, a_id, auto_close, echo, linesep,
                       termination_func, termination_params,
-                      output_func, output_params, output_prefix)
+                      output_func, output_params, output_prefix, thread_name)
 
     def __reduce__(self):
         return self.__class__, (self.__getinitargs__())
@@ -1189,7 +1277,8 @@ class ShellSession(Expect):
     def __init__(self, command=None, a_id=None, auto_close=True, echo=False,
                  linesep="\n", termination_func=None, termination_params=(),
                  output_func=None, output_params=(), output_prefix="",
-                 prompt=r"[\#\$]\s*$", status_test_command="echo $?"):
+                 thread_name=None, prompt=r"[\#\$]\s*$",
+                 status_test_command="echo $?"):
         """
         Initialize the class and run command as a child process.
 
@@ -1223,7 +1312,7 @@ class ShellSession(Expect):
         # Init the superclass
         Expect.__init__(self, command, a_id, auto_close, echo, linesep,
                         termination_func, termination_params,
-                        output_func, output_params, output_prefix)
+                        output_func, output_params, output_prefix, thread_name)
 
         # Remember some attributes
         self.prompt = prompt

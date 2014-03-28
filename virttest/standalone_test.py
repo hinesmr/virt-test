@@ -9,9 +9,12 @@ import glob
 import shutil
 from autotest.client.shared import error
 from autotest.client import utils
+import aexpect
+import asset
 import utils_misc
 import utils_params
 import utils_env
+import utils_net
 import env_process
 import data_dir
 import bootstrap
@@ -20,6 +23,7 @@ import cartesian_config
 import arch
 import funcatexit
 import version
+import qemu_vm
 
 global GUEST_NAME_LIST
 GUEST_NAME_LIST = None
@@ -38,9 +42,8 @@ class Test(object):
     def __init__(self, params, options):
         self.params = utils_params.Params(params)
         self.bindir = data_dir.get_root_dir()
-        self.testdir = os.path.join(self.bindir, 'tests')
         self.virtdir = os.path.join(self.bindir, 'shared')
-        self.builddir = os.path.join(self.bindir, params.get("vm_type"))
+        self.builddir = os.path.join(self.bindir, 'backends', params.get("vm_type"))
 
         self.srcdir = os.path.join(self.builddir, 'src')
         if not os.path.isdir(self.srcdir):
@@ -51,7 +54,10 @@ class Test(object):
             os.makedirs(self.tmpdir)
 
         self.iteration = 0
-        self.tag = params.get("_short_name_map_file")["subtests.cfg"]
+        if options.config:
+            self.tag = params.get("shortname")
+        else:
+            self.tag = params.get("_short_name_map_file")["subtests.cfg"]
         self.debugdir = None
         self.outputdir = None
         self.resultsdir = None
@@ -82,6 +88,7 @@ class Test(object):
     def stop_file_logging(self):
         logger = logging.getLogger()
         logger.removeHandler(self.file_handler)
+        self.file_handler.close()
 
     def verify_background_errors(self):
         """
@@ -122,18 +129,19 @@ class Test(object):
             logging.warning("")
 
         # Open the environment file
-        env_filename = os.path.join(self.bindir, params.get("vm_type"),
-                                    params.get("env", "env"))
+        env_filename = os.path.join(
+            data_dir.get_backend_dir(params.get("vm_type")),
+            params.get("env", "env"))
         env = utils_env.Env(env_filename, self.env_version)
 
         test_passed = False
         t_types = None
+        t_type = None
 
         try:
             try:
                 try:
                     subtest_dirs = []
-                    tests_dir = self.testdir
 
                     other_subtests_dirs = params.get("other_tests_dirs", "")
                     for d in other_subtests_dirs.split():
@@ -145,22 +153,39 @@ class Test(object):
                         subtest_dirs += data_dir.SubdirList(subtestdir,
                                                             bootstrap.test_filter)
 
-                    # Verify if we have the correspondent source file for it
-                    subtest_dirs += data_dir.SubdirList(self.testdir,
-                                                        bootstrap.test_filter)
-                    specific_testdir = os.path.join(self.bindir,
-                                                    params.get("vm_type"),
-                                                    "tests")
-                    subtest_dirs += data_dir.SubdirList(specific_testdir,
-                                                        bootstrap.test_filter)
+                    provider = params.get("provider", None)
+
+                    if provider is None:
+                        # Verify if we have the correspondent source file for it
+                        for generic_subdir in asset.get_test_provider_subdirs('generic'):
+                            subtest_dirs += data_dir.SubdirList(generic_subdir,
+                                                                bootstrap.test_filter)
+
+                        for specific_subdir in asset.get_test_provider_subdirs(params.get("vm_type")):
+                            subtest_dirs += data_dir.SubdirList(specific_subdir,
+                                                                bootstrap.test_filter)
+                    else:
+                        provider_info = asset.get_test_provider_info(provider)
+                        for key in provider_info['backends']:
+                            subtest_dirs += data_dir.SubdirList(
+                                provider_info['backends'][key]['path'],
+                                bootstrap.test_filter)
+
                     subtest_dir = None
 
                     # Get the test routine corresponding to the specified
                     # test type
                     logging.debug("Searching for test modules that match "
-                                  "param 'type = %s' on this cartesian dict",
-                                  params.get("type"))
+                                  "'type = %s' and 'provider = %s' "
+                                  "on this cartesian dict",
+                                  params.get("type"), params.get("provider", None))
+
                     t_types = params.get("type").split()
+                    # Make sure we can load provider_lib in tests
+                    for s in subtest_dirs:
+                        if os.path.dirname(s) not in sys.path:
+                            sys.path.insert(0, os.path.dirname(s))
+
                     test_modules = {}
                     for t_type in t_types:
                         for d in subtest_dirs:
@@ -187,7 +212,8 @@ class Test(object):
 
                     # Run the test function
                     for t_type, test_module in test_modules.items():
-                        run_func = getattr(test_module, "run_%s" % t_type)
+                        run_func = utils_misc.get_test_entrypoint_func(
+                            t_type, test_module)
                         try:
                             run_func(self, params, env)
                             self.verify_background_errors()
@@ -294,6 +320,7 @@ class Bcolors(object):
         self.SKIP = ''
         self.FAIL = ''
         self.ERROR = ''
+        self.WARN = ''
         self.ENDC = ''
 
 # Instantiate bcolors to be used in the functions below.
@@ -307,43 +334,88 @@ def print_header(sr):
     print_stdout(bcolors.HEADER + sr + bcolors.ENDC)
 
 
-def print_skip():
+def print_skip(open_fd=False):
     """
     Print SKIP to stdout with SKIP (yellow) color.
     """
-    print_stdout(bcolors.SKIP + "SKIP" + bcolors.ENDC)
+    normal_skip_msg = bcolors.SKIP + "SKIP" + bcolors.ENDC
+    fd_skip_msg = (bcolors.SKIP +
+                   "SKIP (%s fd)" % utils_misc.get_virt_test_open_fds() +
+                   bcolors.ENDC)
+    if open_fd:
+        msg = fd_skip_msg
+    else:
+        msg = normal_skip_msg
+
+    print_stdout(msg)
 
 
-def print_error(t_elapsed):
+def print_error(t_elapsed, open_fd=False):
     """
     Print ERROR to stdout with ERROR (red) color.
     """
-    print_stdout(bcolors.ERROR + "ERROR" +
-                 bcolors.ENDC + " (%.2f s)" % t_elapsed)
+    normal_error_msg = (bcolors.ERROR + "ERROR" +
+                        bcolors.ENDC + " (%.2f s)" % t_elapsed)
+    fd_error_msg = (bcolors.ERROR + "ERROR" +
+                    bcolors.ENDC + " (%.2f s) (%s fd)" %
+                    (t_elapsed, utils_misc.get_virt_test_open_fds()))
+    if open_fd:
+        msg = fd_error_msg
+    else:
+        msg = normal_error_msg
+
+    print_stdout(msg)
 
 
-def print_pass(t_elapsed):
+def print_pass(t_elapsed, open_fd=False):
     """
     Print PASS to stdout with PASS (green) color.
     """
-    print_stdout(bcolors.PASS + "PASS" +
-                 bcolors.ENDC + " (%.2f s)" % t_elapsed)
+    normal_pass_msg = (bcolors.PASS + "PASS" +
+                       bcolors.ENDC + " (%.2f s)" % t_elapsed)
+    fd_pass_msg = (bcolors.PASS + "PASS" +
+                   bcolors.ENDC + " (%.2f s) (%s fd)" %
+                   (t_elapsed, utils_misc.get_virt_test_open_fds()))
+    if open_fd:
+        msg = fd_pass_msg
+    else:
+        msg = normal_pass_msg
+
+    print_stdout(msg)
 
 
-def print_fail(t_elapsed):
+def print_fail(t_elapsed, open_fd=False):
     """
     Print FAIL to stdout with FAIL (red) color.
     """
-    print_stdout(bcolors.FAIL + "FAIL" +
-                 bcolors.ENDC + " (%.2f s)" % t_elapsed)
+    normal_fail_msg = (bcolors.FAIL + "FAIL" +
+                       bcolors.ENDC + " (%.2f s)" % t_elapsed)
+    fd_fail_msg = (bcolors.FAIL + "FAIL" +
+                   bcolors.ENDC + " (%.2f s) (%s fd)" %
+                  (t_elapsed, utils_misc.get_virt_test_open_fds()))
+    if open_fd:
+        msg = fd_fail_msg
+    else:
+        msg = normal_fail_msg
+
+    print_stdout(msg)
 
 
-def print_warn(t_elapsed):
+def print_warn(t_elapsed, open_fd=False):
     """
     Print WARN to stdout with WARN (yellow) color.
     """
-    print_stdout(bcolors.WARN + "WARN" +
-                 bcolors.ENDC + " (%.2f s)" % t_elapsed)
+    normal_warn_msg = (bcolors.WARN + "WARN" +
+                       bcolors.ENDC + " (%.2f s)" % t_elapsed)
+    fd_warn_msg = (bcolors.WARN + "WARN" +
+                   bcolors.ENDC + " (%.2f s) (%s fd)" %
+                   (t_elapsed, utils_misc.get_virt_test_open_fds()))
+    if open_fd:
+        msg = fd_warn_msg
+    else:
+        msg = normal_warn_msg
+
+    print_stdout(msg)
 
 
 def reset_logging():
@@ -356,13 +428,13 @@ def reset_logging():
     logger.setLevel(logging.NOTSET)
 
 
-def configure_console_logging():
+def configure_console_logging(loglevel=logging.DEBUG):
     """
     Simple helper for adding a file logger to the root logger.
     """
     logger = logging.getLogger()
     stream_handler = logging.StreamHandler()
-    stream_handler.setLevel(logging.DEBUG)
+    stream_handler.setLevel(loglevel)
 
     fmt = '%(asctime)s %(levelname)-5.5s| %(message)s'
     formatter = logging.Formatter(fmt=fmt, datefmt='%H:%M:%S')
@@ -373,13 +445,13 @@ def configure_console_logging():
     return stream_handler
 
 
-def configure_file_logging(logfile):
+def configure_file_logging(logfile, loglevel=logging.DEBUG):
     """
     Simple helper for adding a file logger to the root logger.
     """
     logger = logging.getLogger()
     file_handler = logging.FileHandler(filename=logfile)
-    file_handler.setLevel(logging.DEBUG)
+    file_handler.setLevel(loglevel)
 
     fmt = '%(asctime)s %(levelname)-5.5s| %(message)s'
     formatter = logging.Formatter(fmt=fmt, datefmt='%H:%M:%S')
@@ -402,9 +474,9 @@ def create_config_files(options):
     test_dir = os.path.dirname(shared_dir)
 
     if (options.type and options.config):
-        test_dir = os.path.join(test_dir, options.type)
+        test_dir = data_dir.get_backend_dir(options.type)
     elif options.type:
-        test_dir = os.path.join(test_dir, options.type)
+        test_dir = data_dir.get_backend_dir(options.type)
     elif options.config:
         parent_config_dir = os.path.dirname(options.config)
         parent_config_dir = os.path.dirname(parent_config_dir)
@@ -504,9 +576,12 @@ def print_test_list(options, cartesian_parser):
 
 def get_guest_name_parser(options):
     cartesian_parser = cartesian_config.Parser()
-    cfgdir = os.path.join(data_dir.get_root_dir(), options.type, "cfg")
-    cartesian_parser.parse_file(os.path.join(cfgdir, "machines.cfg"))
-    cartesian_parser.parse_file(os.path.join(cfgdir, "guest-os.cfg"))
+    machines_cfg_path = data_dir.get_backend_cfg_path(options.type,
+                                                      'machines.cfg')
+    guest_os_cfg_path = data_dir.get_backend_cfg_path(options.type,
+                                                      'guest-os.cfg')
+    cartesian_parser.parse_file(machines_cfg_path)
+    cartesian_parser.parse_file(guest_os_cfg_path)
     if options.arch:
         cartesian_parser.only_filter(options.arch)
     if options.machine_type:
@@ -552,13 +627,13 @@ def print_guest_list(options):
         index += 1
         base_dir = params.get("images_base_dir", data_dir.get_data_dir())
         image_name = storage.get_image_filename(params, base_dir)
-        shortname = params['shortname']
+        name = params['name']
         if os.path.isfile(image_name):
             out = (bcolors.blue + str(index) + bcolors.end + " " +
-                   shortname + "\n")
+                   name + "\n")
         else:
             out = (bcolors.blue + str(index) + bcolors.end + " " +
-                   shortname + " " + bcolors.yellow +
+                   name + " " + bcolors.yellow +
                    "(missing %s)" % os.path.basename(image_name) +
                    bcolors.end + "\n")
         pipe.write(out)
@@ -573,11 +648,8 @@ def bootstrap_tests(options):
 
     :param options: OptParse object with program command line options.
     """
-    test_dir = os.path.dirname(sys.modules[__name__].__file__)
-
     if options.type:
-        test_dir = os.path.abspath(os.path.join(os.path.dirname(test_dir),
-                                                options.type))
+        test_dir = data_dir.get_backend_dir(options.type)
     elif options.config:
         parent_config_dir = os.path.dirname(os.path.dirname(options.config))
         parent_config_dir = os.path.dirname(parent_config_dir)
@@ -590,6 +662,11 @@ def bootstrap_tests(options):
         check_modules = None
     online_docs_url = "https://github.com/autotest/virt-test/wiki"
 
+    if not options.config:
+        restore_image = not options.keep_image
+    else:
+        restore_image = False
+
     kwargs = {'test_name': options.type,
               'test_dir': test_dir,
               'base_dir': data_dir.get_data_dir(),
@@ -597,8 +674,10 @@ def bootstrap_tests(options):
               'check_modules': check_modules,
               'online_docs_url': online_docs_url,
               'download_image': not options.no_downloads,
-              'restore_image': options.restore,
-              'interactive': False}
+              'selinux': options.selinux_setup,
+              'restore_image': restore_image,
+              'interactive': False,
+              'update_providers': options.update_providers}
 
     # Tolerance we have without printing a message for the user to wait (3 s)
     tolerance = 3
@@ -635,13 +714,40 @@ def bootstrap_tests(options):
     print_stdout(bcolors.HEADER + "SETUP:" + bcolors.ENDC, end=False)
 
     if not failed:
-        print_pass(t_elapsed)
+        print_pass(t_elapsed, open_fd=options.show_open_fd)
     else:
-        print_fail(t_elapsed)
+        print_fail(t_elapsed, open_fd=options.show_open_fd)
         print_stdout("Setup error: %s" % reason)
         sys.exit(-1)
 
     return True
+
+
+def cleanup_env(parser, options):
+    """
+    Clean up virt-test temporary files.
+
+    :param parser: Cartesian parser with run parameters.
+    :param options: Test runner options object.
+    """
+    if options.no_cleanup:
+        logging.info("Option --no-cleanup requested, not cleaning temporary "
+                     "files and VM processes...")
+        logging.info("")
+    else:
+        logging.info("Cleaning tmp files and VM processes...")
+        d = parser.get_dicts().next()
+        env_filename = os.path.join(data_dir.get_root_dir(),
+                                    options.type, d.get("env", "env"))
+        env = utils_env.Env(filename=env_filename, version=Test.env_version)
+        env.destroy()
+        # Kill all tail_threads which env constructor recreate.
+        aexpect.kill_tail_threads()
+        aexpect.clean_tmp_files()
+        utils_net.clean_tmp_files()
+        data_dir.clean_tmp_files()
+        qemu_vm.clean_tmp_files()
+        logging.info("")
 
 
 def _job_report(job_elapsed_time, n_tests, n_tests_skipped, n_tests_failed):
@@ -695,11 +801,13 @@ def run_tests(parser, options):
     generated by the configuration system, handling dependencies.
 
     :param parser: Config parser object.
+    :param options: Test runner options object.
     :return: True, if all tests ran passed, False if any of them failed.
     """
     test_start_time = time.strftime('%Y-%m-%d-%H.%M.%S')
     logdir = options.logdir or os.path.join(data_dir.get_root_dir(), 'logs')
-    debugdir = os.path.join(logdir, 'run-%s' % test_start_time)
+    debugbase = 'run-%s' % test_start_time
+    debugdir = os.path.join(logdir, debugbase)
     latestdir = os.path.join(logdir, "latest")
     if not os.path.isdir(debugdir):
         os.makedirs(debugdir)
@@ -707,10 +815,11 @@ def run_tests(parser, options):
         os.unlink(latestdir)
     except OSError, detail:
         pass
-    os.symlink(debugdir, latestdir)
+    os.symlink(debugbase, latestdir)
 
     debuglog = os.path.join(debugdir, "debug.log")
-    configure_file_logging(debuglog)
+    loglevel = options.log_level
+    configure_file_logging(debuglog, loglevel)
 
     print_stdout(bcolors.HEADER +
                  "DATA DIR: %s" % data_dir.get_backing_data_dir() +
@@ -726,28 +835,16 @@ def run_tests(parser, options):
     logging.info(version.get_pretty_version_info())
     logging.info("")
 
-    logging.debug("Cleaning up previous job tmp files")
-    d = parser.get_dicts().next()
-    env_filename = os.path.join(data_dir.get_root_dir(),
-                                options.type, d.get("env", "env"))
-    env = utils_env.Env(env_filename, Test.env_version)
-    env.destroy()
-    try:
-        address_pool_files = glob.glob("/tmp/address_pool*")
-        for address_pool_file in address_pool_files:
-            os.remove(address_pool_file)
-        aexpect_tmp = "/tmp/aexpect_spawn/"
-        if os.path.isdir(aexpect_tmp):
-            shutil.rmtree("/tmp/aexpect_spawn/")
-    except (IOError, OSError):
-        pass
-    logging.debug("")
+    cleanup_env(parser, options)
 
-    if options.restore_image_between_tests:
-        logging.debug("Creating first backup of guest image")
-        qemu_img = storage.QemuImg(d, data_dir.get_data_dir(), "image")
-        qemu_img.backup_image(d, data_dir.get_data_dir(), 'backup', True)
-        logging.debug("")
+    d = parser.get_dicts().next()
+
+    if not options.config:
+        if not options.keep_image_between_tests:
+            logging.debug("Creating first backup of guest image")
+            qemu_img = storage.QemuImg(d, data_dir.get_data_dir(), "image")
+            qemu_img.backup_image(d, data_dir.get_data_dir(), 'backup', True)
+            logging.debug("")
 
     for line in get_cartesian_parser_details(parser).splitlines():
         logging.info(line)
@@ -845,7 +942,7 @@ def run_tests(parser, options):
                              reason.__class__.__name__, reason)
                 logging.info("")
                 t.stop_file_logging()
-                print_error(t_elapsed)
+                print_error(t_elapsed, open_fd=options.show_open_fd)
                 status_dct[dct.get("name")] = False
                 continue
             except error.TestNAError, reason:
@@ -854,7 +951,7 @@ def run_tests(parser, options):
                              reason.__class__.__name__, reason)
                 logging.info("")
                 t.stop_file_logging()
-                print_skip()
+                print_skip(open_fd=options.show_open_fd)
                 status_dct[dct.get("name")] = False
                 continue
             except error.TestWarn, reason:
@@ -863,7 +960,7 @@ def run_tests(parser, options):
                              reason)
                 logging.info("")
                 t.stop_file_logging()
-                print_warn(t_elapsed)
+                print_warn(t_elapsed, open_fd=options.show_open_fd)
                 status_dct[dct.get("name")] = True
                 continue
             except Exception, reason:
@@ -883,18 +980,20 @@ def run_tests(parser, options):
                 t.stop_file_logging()
                 current_status = False
         else:
-            print_skip()
+            print_skip(open_fd=options.show_open_fd)
             status_dct[dct.get("name")] = False
             continue
 
         if not current_status:
             failed = True
-            print_fail(t_elapsed)
+            print_fail(t_elapsed, open_fd=options.show_open_fd)
 
         else:
-            print_pass(t_elapsed)
+            print_pass(t_elapsed, open_fd=options.show_open_fd)
 
         status_dct[dct.get("name")] = current_status
+
+    cleanup_env(parser, options)
 
     job_end_time = time.time()
     job_elapsed_time = job_end_time - job_start_time

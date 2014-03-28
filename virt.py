@@ -6,7 +6,7 @@ import Queue
 from autotest.client import test
 from autotest.client.shared import error
 from virttest import utils_misc, utils_params, utils_env, env_process
-from virttest import data_dir, bootstrap, funcatexit, version
+from virttest import data_dir, bootstrap, funcatexit, version, asset
 
 
 class virt(test.test):
@@ -28,7 +28,7 @@ class virt(test.test):
         virtdir = os.path.dirname(sys.modules[__name__].__file__)
         self.virtdir = os.path.join(virtdir, "shared")
         # Place where virt software will be built/linked
-        self.builddir = os.path.join(virtdir, params.get("vm_type"))
+        self.builddir = os.path.join(virtdir, 'backends', params.get("vm_type"))
         self.background_errors = Queue.Queue()
 
     def verify_background_errors(self):
@@ -68,13 +68,15 @@ class virt(test.test):
         utils_misc.set_log_file_dir(self.debugdir)
 
         # Open the environment file
-        env_path = params.get("vm_type")
-        other_subtests_dirs = params.get("other_tests_dirs", "")
-        if other_subtests_dirs:
-            env_path = other_subtests_dirs
-        env_filename = os.path.join(self.bindir, env_path,
+        custom_env_path = params.get("custom_env_path", "")
+        if custom_env_path:
+            env_path = custom_env_path
+        else:
+            env_path = params.get("vm_type")
+        env_filename = os.path.join(self.bindir, "backends", env_path,
                                     params.get("env", "env"))
         env = utils_env.Env(env_filename, self.env_version)
+        other_subtests_dirs = params.get("other_tests_dirs", "")
 
         test_passed = False
         t_type = None
@@ -94,21 +96,35 @@ class virt(test.test):
                                                   " exist." % (subtestdir))
                         subtest_dirs += data_dir.SubdirList(subtestdir,
                                                             bootstrap.test_filter)
+
                     # Verify if we have the correspondent source file for it
-                    shared_test_dir = os.path.dirname(self.virtdir)
-                    shared_test_dir = os.path.join(shared_test_dir, "tests")
-                    subtest_dirs += data_dir.SubdirList(shared_test_dir,
-                                                        bootstrap.test_filter)
-                    virt_test_dir = os.path.join(self.bindir,
-                                                 params.get("vm_type"), "tests")
-                    subtest_dirs += data_dir.SubdirList(virt_test_dir,
-                                                        bootstrap.test_filter)
+                    for generic_subdir in asset.get_test_provider_subdirs('generic'):
+                        subtest_dirs += data_dir.SubdirList(generic_subdir,
+                                                            bootstrap.test_filter)
+
+                    for specific_subdir in asset.get_test_provider_subdirs(params.get("vm_type")):
+                        subtest_dirs += data_dir.SubdirList(specific_subdir,
+                                                            bootstrap.test_filter)
+
                     subtest_dir = None
 
                     # Get the test routine corresponding to the specified
                     # test type
+                    logging.debug("Searching for test modules that match "
+                                  "'type = %s' and 'provider = %s' "
+                                  "on this cartesian dict",
+                                  params.get("type"), params.get("provider", None))
+
                     t_types = params.get("type").split()
-                    test_modules = []
+                    provider = params.get("provider", None)
+                    if provider is not None:
+                        subtest_dirs = [d for d in subtest_dirs if provider in d]
+                    # Make sure we can load provider_lib in tests
+                    for s in subtest_dirs:
+                        if os.path.dirname(s) not in sys.path:
+                            sys.path.insert(0, os.path.dirname(s))
+
+                    test_modules = {}
                     for t_type in t_types:
                         for d in subtest_dirs:
                             module_path = os.path.join(d, "%s.py" % t_type)
@@ -121,20 +137,19 @@ class virt(test.test):
                             raise error.TestError(msg)
                         # Load the test module
                         f, p, d = imp.find_module(t_type, [subtest_dir])
-                        test_modules.append((t_type,
-                                             imp.load_module(t_type, f, p, d)))
+                        test_modules[t_type] = imp.load_module(t_type, f, p, d)
                         f.close()
+
                     # Preprocess
                     try:
                         params = env_process.preprocess(self, params, env)
                     finally:
                         env.save()
+
                     # Run the test function
-                    for t_type, test_module in test_modules:
-                        msg = "Running function: %s.run_%s()" % (
-                            t_type, t_type)
-                        logging.info(msg)
-                        run_func = getattr(test_module, "run_%s" % t_type)
+                    for t_type, test_module in test_modules.items():
+                        run_func = utils_misc.get_test_entrypoint_func(
+                            t_type, test_module)
                         try:
                             run_func(self, params, env)
                             self.verify_background_errors()

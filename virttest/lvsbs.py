@@ -3,7 +3,8 @@ Higher order classes for Libvirt Sandbox Service (lxc) service container testing
 """
 
 from autotest.client import utils
-from autotest.client.shared.service import SpecificServiceManager, COMMANDS
+from autotest.client.shared.service import COMMANDS
+from virttest.staging import service
 import lvsb_base
 import virsh
 
@@ -22,12 +23,16 @@ class SandboxService(object):
         #   Use virsh for list/edit/modify manipulation
         self.virsh = virsh.Virsh(uri=uri, ignore_status=True)
         self.command = lvsb_base.SandboxCommandBase(params, service_name)
-        self.command.BINARY_PATH_PARAM = 'virt_sandbox_service_binary'
+        self.command.BINARY_PATH_PARAM = params.get('virt_sandbox_service_binary',
+                                                    "virt-sandbox-service")
         self.command.add_optarg('--connect', uri)
-        # SpecificServiceManager is not pickleable, save init args
+        # We need to pass self.service_name to service.Factory.create_service to
+        # create a service. Then we will get a SpecificServiceManager object as
+        # self.service. But SpecificServiceManager is not pickleable, save init
+        # args here.
         self._run = utils.run
-        self.service = SpecificServiceManager(self.service_name,
-                                              run=self._run)
+        self.service = service.Factory.create_service(self.service_name,
+                                                      run=self._run)
         # make self.start() --> self.service.start()
         self._bind_service_commands()
 
@@ -50,8 +55,8 @@ class SandboxService(object):
         self.command = state['command']
         # Recreate SpecificServiceManager from the init args
         self._run = state['run']
-        self.service = SpecificServiceManager(self.service_name,
-                                              run=self._run)
+        self.service = service.Factory.create_service(self.service_name,
+                                                      run=self._run)
         self._bind_service_commands()
 
     # Enforce read-only at all levels

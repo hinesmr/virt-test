@@ -18,10 +18,7 @@ from tempfile import mkdtemp
 from autotest.client import utils
 from autotest.client.shared import error
 
-try:
-    from autotest.client.shared import service
-except ImportError:
-    import service
+import service
 
 
 class Cgroup(object):
@@ -610,19 +607,23 @@ def get_load_per_cpu(_stats=None):
     return stats
 
 
-def get_cgroup_mountpoint(controller):
+def get_cgroup_mountpoint(controller, mount_file="/proc/mounts"):
     """
     Get desired controller's mountpoint
 
-    @controller: Desired controller
+    :param controller: Desired controller
+    :param mount_file: Name of file contains mounting information, in most
+                       cases this are not need to be set.
     :return: controller's mountpoint
+    :raise: TestError when contoller doesn't exist in mount table
     """
-    if controller not in get_all_controllers():
-        raise error.TestError("Doesn't support controller <%s>" % controller)
-    f_cgcon = open("/proc/mounts", "rU")
+    f_cgcon = open(mount_file, "rU")
     cgconf_txt = f_cgcon.read()
     f_cgcon.close()
-    mntpt = re.findall(r"\s(\S*cgroup/\S*,*%s,*\S*)" % controller, cgconf_txt)
+    mntpt = re.findall(r"\s(\S*cgroup/\S*%s(?=[,\ ])\S*)" % controller, cgconf_txt)
+    if len(mntpt) == 0:
+        # Controller is not supported if not found in mount table.
+        raise error.TestError("Doesn't support controller <%s>" % controller)
     return mntpt[0]
 
 
@@ -654,8 +655,6 @@ def resolve_task_cgroup_path(pid, controller):
 
     :return: resolved path for cgroup controllers of a given pid
     """
-    if controller not in get_all_controllers():
-        raise error.TestError("Doesn't support controller <%s>" % controller)
     root_path = get_cgroup_mountpoint(controller)
 
     proc_cgroup = "/proc/%d/cgroup" % pid
@@ -669,7 +668,7 @@ def resolve_task_cgroup_path(pid, controller):
     finally:
         proc_file.close()
 
-    mount_path = re.findall(r":\S*,*%s,*\S*:(\S*)\n" % controller, proc_cgroup_txt)
+    mount_path = re.findall(r":\S*%s(?=[,:])\S*:(\S*)\n" % controller, proc_cgroup_txt)
     return os.path.join(root_path, mount_path[0].strip("/"))
 
 
@@ -680,7 +679,7 @@ class CgconfigService(object):
     """
 
     def __init__(self):
-        self._service_manager = service.SpecificServiceManager("cgconfig")
+        self._service_manager = service.Factory.create_service("cgconfig")
 
     def _service_cgconfig_control(self, action):
         """

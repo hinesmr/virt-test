@@ -257,6 +257,25 @@ class PropCanBase(dict, PropCanInternal):
         """
         return self.__class__(dict(self))
 
+    def update(self, other=None, excpt=AttributeError, **kwargs):
+        """
+        Update properties in __all_slots__ with another dict.
+        """
+        _tmp_dict = dict()
+        _other_dict = dict()
+
+        if other:
+            _other_dict = dict(other)
+
+        try:
+            _tmp_dict.update(_other_dict)
+            _tmp_dict.update(kwargs)
+        except TypeError, detail:
+            raise excpt(detail)
+
+        for item in _tmp_dict.keys():
+            self[item] = _tmp_dict[item]
+
 
 class PropCan(PropCanBase):
 
@@ -316,13 +335,3 @@ class PropCan(PropCanBase):
         """
         if value:
             self[key] = value
-
-    def __str__(self):
-        """
-        Guarantee return of string format dictionary representation
-        """
-        acceptable_types = (str, unicode, int, float, long)
-        return str(dict([(key, value) for key, value in self.items()
-                         if issubclass(type(value), acceptable_types)]))
-
-    __repr__ = __str__

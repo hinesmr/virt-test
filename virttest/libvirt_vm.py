@@ -110,7 +110,7 @@ class VM(virt_vm.BaseVM):
             self.__dict__ = state
         else:
             self.process = None
-            self.serial_ports = None
+            self.serial_ports = []
             self.serial_console = None
             self.redirs = {}
             self.vnc_port = None
@@ -120,6 +120,7 @@ class VM(virt_vm.BaseVM):
             self.device_id = []
             self.pci_devices = []
             self.uuid = None
+            self.remote_sessions = []
 
         self.spice_port = 8000
         self.name = name
@@ -242,7 +243,7 @@ class VM(virt_vm.BaseVM):
         """
         return virsh.dumpxml(self.name, uri=self.connect_uri).stdout.strip()
 
-    def backup_xml(self):
+    def backup_xml(self, active=False):
         """
         Backup the guest's xmlfile.
         """
@@ -251,7 +252,13 @@ class VM(virt_vm.BaseVM):
         try:
             xml_file = tempfile.mktemp(dir="/tmp")
 
-            virsh.dumpxml(self.name, to_file=xml_file, uri=self.connect_uri)
+            if active:
+                extra = ""
+            else:
+                extra = "--inactive"
+
+            virsh.dumpxml(self.name, extra=extra,
+                          to_file=xml_file, uri=self.connect_uri)
             return xml_file
         except Exception, detail:
             if os.path.exists(xml_file):
@@ -487,6 +494,28 @@ class VM(virt_vm.BaseVM):
                 return " --connect=%s" % uri
             else:
                 return ""
+
+        def add_security(help_text, sec_type, sec_label=None, sec_relabel=None):
+            """
+            Return security options for install command.
+            """
+            if has_option(help_text, "security"):
+                result = " --security"
+                if sec_type == 'static':
+                    if sec_label is None:
+                        raise ValueError("Seclabel is not setted for static.")
+                    result += " type=static,label=%s" % (sec_label)
+                elif sec_type == 'dynamic':
+                    result += " type=dynamic"
+                else:
+                    raise ValueError("Security type %s is not supported."
+                                     % sec_type)
+                if sec_relabel is not None:
+                    result += ",relabel=%s" % sec_relabel
+            else:
+                result = ""
+
+            return result
 
         def add_nic(help_text, nic_params):
             """
@@ -806,6 +835,14 @@ class VM(virt_vm.BaseVM):
 
         virt_install_cmd += " --noautoconsole"
 
+        sec_type = params.get("sec_type", None)
+        if sec_type:
+            sec_label = params.get("sec_label", None)
+            sec_relabel = params.get("sec_relabel", None)
+            virt_install_cmd += add_security(help_text, sec_type=sec_type,
+                                             sec_label=sec_label,
+                                             sec_relabel=sec_relabel)
+
         return virt_install_cmd
 
     def get_serial_console_filename(self, name):
@@ -824,13 +861,16 @@ class VM(virt_vm.BaseVM):
         return [self.get_serial_console_filename(_) for _ in
                 self.params.objects("isa_serials")]
 
-    def setup_serial_ports(self):
-        if self.serial_ports is None:
-            self.serial_ports = []
+    def create_serial_console(self):
+        """
+        Establish a session with the serial console.
+
+        The libvirt version uses virsh console to manage it.
+        """
+        if not self.serial_ports:
             for serial in self.params.objects("isa_serials"):
                 self.serial_ports.append(serial)
         if self.serial_console is None:
-            # Attempt to setup serial0
             try:
                 cmd = 'virsh'
                 if self.connect_uri:
@@ -848,19 +888,6 @@ class VM(virt_vm.BaseVM):
                                                        output_params=output_params)
             # Cause serial_console.close() to close open log file
             self.serial_console.set_log_file(output_filename)
-
-    def cleanup_serial_console(self):
-        """
-        Close serial console and associated log file
-        """
-        if self.serial_console is not None:
-            self.serial_console.close()
-            self.serial_console = None
-        if hasattr(self, "migration_file"):
-            try:
-                os.unlink(self.migration_file)
-            except OSError:
-                pass
 
     def set_root_serial_console(self, device, remove=False):
         """
@@ -944,6 +971,8 @@ class VM(virt_vm.BaseVM):
             try:
                 # Only configurate RHEL5 and below
                 regex = "gettys are handled by"
+                # As of RHEL7 systemd message is displayed
+                regex += "|inittab is no longer used when using systemd"
                 output = session.cmd_output("cat /etc/inittab")
                 if re.search(regex, output):
                     logging.debug("Skip setting inittab for %s", device)
@@ -963,6 +992,19 @@ class VM(virt_vm.BaseVM):
                 session.close()
         logging.debug("Set inittab for %s failed.", device)
         return False
+
+    def cleanup_serial_console(self):
+        """
+        Close serial console and associated log file
+        """
+        if self.serial_console is not None:
+            self.serial_console.close()
+            self.serial_console = None
+        if hasattr(self, "migration_file"):
+            try:
+                os.unlink(self.migration_file)
+            except OSError:
+                pass
 
     @error.context_aware
     def create(self, name=None, params=None, root_dir=None, timeout=5.0,
@@ -1020,7 +1062,9 @@ class VM(virt_vm.BaseVM):
                 if not os.path.exists(iso):
                     raise virt_vm.VMImageMissingError(iso)
                 compare = False
-                if cdrom_params.get("md5sum_1m"):
+                if cdrom_params.get("skip_hash"):
+                    logging.debug("Skipping hash comparison")
+                elif cdrom_params.get("md5sum_1m"):
                     logging.debug("Comparing expected MD5 sum with MD5 sum of "
                                   "first MB of ISO file...")
                     actual_hash = utils.hash_file(iso, 1048576, method="md5")
@@ -1143,7 +1187,7 @@ class VM(virt_vm.BaseVM):
             self.uuid = virsh.domuuid(self.name,
                                       uri=self.connect_uri).stdout.strip()
             # Create isa serial ports.
-            self.setup_serial_ports()
+            self.create_serial_console()
         finally:
             fcntl.lockf(lockfile, fcntl.LOCK_UN)
             lockfile.close()
@@ -1170,7 +1214,7 @@ class VM(virt_vm.BaseVM):
         # Since dest_uri could be None, checking it is necessary.
         if result.exit_status == 0 and dest_uri:
             self.connect_uri = dest_uri
-        self.setup_serial_ports()
+        self.create_serial_console()
         return result
 
     def attach_interface(self, option="", ignore_status=False,
@@ -1428,10 +1472,9 @@ class VM(virt_vm.BaseVM):
                                       uri=self.connect_uri).stdout.strip()
             # Establish a session with the serial console
             if autoconsole:
-                self.setup_serial_ports()
+                self.create_serial_console()
         else:
-            raise virt_vm.VMStartError(self.name, "libvirt domain failed "
-                                                  "to start")
+            raise virt_vm.VMStartError(self.name, result.stderr.strip())
 
     def wait_for_shutdown(self, count=60):
         """
@@ -1526,7 +1569,7 @@ class VM(virt_vm.BaseVM):
         if self.is_dead():
             raise virt_vm.VMStatusError(
                 "VM should not be %s after restore." % self.state())
-        self.setup_serial_ports()
+        self.create_serial_console()
 
     def vcpupin(self, vcpu, cpu_list, options=""):
         """
@@ -1613,6 +1656,26 @@ class VM(virt_vm.BaseVM):
             if details['device'] == "disk":
                 disk_devices[target] = details
         return disk_devices
+
+    def get_first_disk_devices(self):
+        """
+        Get vm's first disk type block devices.
+        """
+        disk = {}
+        options = "--details"
+        result = virsh.domblklist(self.name, options, ignore_status=True,
+                                  uri=self.connect_uri)
+        blklist = result.stdout.strip().splitlines()
+        if result.exit_status != 0:
+            logging.info("Get vm devices failed.")
+        else:
+            blklist = blklist[2:]
+            linesplit = blklist[0].split(None, 4)
+            disk = {'type': linesplit[0],
+                    'device': linesplit[1],
+                    'target': linesplit[2],
+                    'source': linesplit[3]}
+        return disk
 
     def get_max_mem(self):
         """

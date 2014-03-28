@@ -3,11 +3,9 @@
 import unittest
 import cPickle
 import sys
-try:
-    import autotest.common as common
-except ImportError:
-    import common
-from autotest.client.shared import base_utils
+
+import common
+from autotest.client.shared import utils
 from autotest.client.shared.test_utils import mock
 from versionable_class import Manager, factory, VersionableClass
 man = Manager(__name__)
@@ -270,8 +268,8 @@ class TestVersionableClass(unittest.TestCase):
 
     def setUp(self):
         self.god = mock.mock_god(ut=self)
-        self.god.stub_function(base_utils.logging, 'warn')
-        self.god.stub_function(base_utils.logging, 'debug')
+        self.god.stub_function(utils.logging, 'warn')
+        self.god.stub_function(utils.logging, 'debug')
         self.version = 1
 
     def tearDown(self):
